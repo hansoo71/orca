@@ -1,0 +1,461 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#070A12}canvas{display:block}</style>
+</head><body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+const W = 1920, H = 1080, DUR = 15;
+const ctx = document.getElementById('c').getContext('2d');
+const C = {
+  bg: '#070A12', text: '#EEF2F8', dim: '#7A859E', dim2: '#4A5470',
+  jev: '#3DF5C8', jev2: '#2BB8FF', llm: '#FF6B5A', warn: '#FFB547',
+  card: 'rgba(20,28,46,0.92)', stroke: 'rgba(255,255,255,0.10)'
+};
+const KR = 'NotoKR', MONO = 'JBMono';
+
+async function loadFonts() {
+  const list = [
+    [KR, 'fonts/kr400.ttf', '400'], [KR, 'fonts/kr700.ttf', '700'], [KR, 'fonts/kr900.ttf', '900'],
+    [MONO, 'fonts/mono500.ttf', '500'], [MONO, 'fonts/mono700.ttf', '700']
+  ];
+  for (const [fam, url, weight] of list) {
+    const f = new FontFace(fam, `url(${url})`, { weight });
+    await f.load(); document.fonts.add(f);
+  }
+}
+
+// ---------- easing / timing ----------
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, u) => a + (b - a) * u;
+const P = (t, a, b) => clamp((t - a) / (b - a));
+const eo = u => 1 - Math.pow(1 - u, 3);
+const eio = u => u < .5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+const eback = u => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(u - 1, 3) + c1 * Math.pow(u - 1, 2); };
+// scene envelope: fade in over [a,a+fi], out over [b-fo,b]
+const env = (t, a, b, fi = .4, fo = .4) => eo(P(t, a, a + fi)) * (1 - eio(P(t, b - fo, b)));
+
+// ---------- drawing helpers ----------
+function setFont(size, weight = 700, fam = KR) { ctx.font = `${weight} ${size}px ${fam}`; }
+function text(s, x, y, o = {}) {
+  const { size = 40, weight = 700, color = C.text, align = 'left', alpha = 1, fam = KR, glow = 0, glowColor } = o;
+  ctx.save();
+  setFont(size, weight, fam);
+  ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  ctx.globalAlpha *= alpha; ctx.fillStyle = color;
+  if (glow) { ctx.shadowBlur = glow; ctx.shadowColor = glowColor || color; }
+  ctx.fillText(s, x, y);
+  ctx.restore();
+}
+// multi-colored inline segments: [[str, color, weight?], ...]
+function rich(segs, x, y, o = {}) {
+  const { size = 40, align = 'left', alpha = 1, fam = KR, weight = 700 } = o;
+  let total = 0;
+  for (const [s, , w] of segs) { setFont(size, w || weight, fam); total += ctx.measureText(s).width; }
+  let cx = align === 'center' ? x - total / 2 : align === 'right' ? x - total : x;
+  for (const [s, col, w] of segs) {
+    text(s, cx, y, { size, weight: w || weight, color: col, alpha, fam });
+    setFont(size, w || weight, fam); cx += ctx.measureText(s).width;
+  }
+  return total;
+}
+function measure(s, size, weight = 700, fam = KR) { setFont(size, weight, fam); return ctx.measureText(s).width; }
+function rrect(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function card(x, y, w, h, o = {}) {
+  const { alpha = 1, stroke = C.stroke, fill = C.card, r = 22, glow = 0, glowColor } = o;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  rrect(x, y, w, h, r);
+  if (glow) { ctx.shadowBlur = glow; ctx.shadowColor = glowColor; }
+  ctx.fillStyle = fill; ctx.fill();
+  ctx.shadowBlur = 0; ctx.lineWidth = 2; ctx.strokeStyle = stroke; ctx.stroke();
+  ctx.restore();
+}
+function pill(label, x, y, o = {}) {
+  const { size = 26, color = C.jev, alpha = 1, fill = true, fam = KR, weight = 700, padX = 22, h = size * 1.75, align = 'left' } = o;
+  const w = measure(label, size, weight, fam) + padX * 2;
+  const px = align === 'center' ? x - w / 2 : x;
+  ctx.save(); ctx.globalAlpha *= alpha;
+  rrect(px, y, w, h, h / 2);
+  ctx.fillStyle = fill ? hexA(color, .14) : 'rgba(0,0,0,0)'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = hexA(color, .8); ctx.stroke();
+  ctx.restore();
+  text(label, px + padX, y + h / 2 + size * .36, { size, weight, color, alpha, fam });
+  return w;
+}
+function hexA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`;
+}
+function grad(x0, y0, x1, y1, a = C.jev, b = C.jev2) {
+  const g = ctx.createLinearGradient(x0, y0, x1, y1); g.addColorStop(0, a); g.addColorStop(1, b); return g;
+}
+function bez(p0, p1, p2, p3, u) {
+  const m = 1 - u;
+  return [m*m*m*p0[0] + 3*m*m*u*p1[0] + 3*m*u*u*p2[0] + u*u*u*p3[0],
+          m*m*m*p0[1] + 3*m*m*u*p1[1] + 3*m*u*u*p2[1] + u*u*u*p3[1]];
+}
+function curve(a, b, alpha, color, draw = 1) {
+  const c1 = [lerp(a[0], b[0], .5), a[1]], c2 = [lerp(a[0], b[0], .5), b[1]];
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.setLineDash([]);
+  ctx.beginPath();
+  const N = 40;
+  for (let i = 0; i <= N * draw; i++) { const p = bez(a, c1, c2, b, i / N); i ? ctx.lineTo(...p) : ctx.moveTo(...p); }
+  ctx.stroke(); ctx.restore();
+  return u => bez(a, c1, c2, b, u);
+}
+function dot(x, y, r, color, alpha = 1) {
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.fillStyle = color; ctx.shadowBlur = 18; ctx.shadowColor = color;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+}
+
+// ---------- background ----------
+function background(t) {
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  // drifting grid
+  ctx.save(); ctx.strokeStyle = 'rgba(120,150,200,0.06)'; ctx.lineWidth = 1;
+  const s = 80, off = (t * 12) % s;
+  for (let x = -s + off; x < W + s; x += s) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = -s + off * .5; y < H + s; y += s) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  ctx.restore();
+  // color wash: warm during LLM scene, cool afterwards
+  const warm = 1 - P(t, 2.8, 3.6);
+  const g1 = ctx.createRadialGradient(W * .25, H * .3, 0, W * .25, H * .3, 900);
+  g1.addColorStop(0, hexA(C.llm, .10 * warm)); g1.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g1; ctx.fillRect(0, 0, W, H);
+  const cool = P(t, 3.0, 4.0);
+  const cx = W * .5 + Math.sin(t * .6) * 200, cy = H * .5 + Math.cos(t * .5) * 80;
+  const g2 = ctx.createRadialGradient(cx, cy, 0, cx, cy, 1000);
+  g2.addColorStop(0, hexA(C.jev, .085 * cool)); g2.addColorStop(.5, hexA(C.jev2, .04 * cool)); g2.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g2; ctx.fillRect(0, 0, W, H);
+  // vignette
+  const v = ctx.createRadialGradient(W / 2, H / 2, 400, W / 2, H / 2, 1200);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.55)');
+  ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+}
+
+// ---------- Scene 1: LLM generates token by token (0 - 3.4) ----------
+const TOKENS = [
+  ['이', 0], [' 티켓은', 0], [' 아마도', 1], [' 결제', 0], [' 문의', 0], ['일', 0], [' 것', 0], [' 같습니다.', 0],
+  [' 다만', 0], [' 배송', 0], [' 지연', 0], ['일', 0], [' 수도', 1], [' 있고,', 1], [' 혹시', 1], [' 환불', 0],
+  [' 요청', 0], ['이라면', 1], [' …', 0]
+];
+function scene1(t) {
+  const a = env(t, 0, 3.4, .35, .45);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+  const sx = -60 * eio(P(t, 3.0, 3.4));
+  ctx.translate(sx, 0);
+
+  pill('기존 LLM', 140, 120, { color: C.llm, alpha: eo(P(t, 0, .4)) });
+  const hy = 270 + 20 * (1 - eo(P(t, .05, .5)));
+  rich([['LLM은 토큰을 ', C.text], ['하나씩 생성', C.llm], ['합니다', C.text]], 140, hy, { size: 72, weight: 900, alpha: eo(P(t, .05, .5)) });
+
+  // chat bubble
+  const bx = 140, by = 340, bw = 1640, bh = 300;
+  card(bx, by, bw, bh, { alpha: eo(P(t, .2, .6)) });
+  text('PROMPT  ›  "이 고객 티켓을 분류해줘"', bx + 44, by + 64, { size: 26, weight: 500, fam: MONO, color: C.dim, alpha: eo(P(t, .3, .7)) });
+  // stream tokens
+  const n = clamp(Math.floor((t - .55) / .115) + 1, 0, TOKENS.length);
+  let x = bx + 44, y = by + 150; const maxX = bx + bw - 60, size = 50;
+  setFont(size, 700);
+  for (let i = 0; i < n; i++) {
+    let [s, hl] = TOKENS[i];
+    let w = measure(s, size);
+    if (x + w > maxX) { x = bx + 44; y += 76; s = s.trimStart(); w = measure(s, size); }
+    const age = P(t, .55 + i * .115, .55 + i * .115 + .15);
+    // token chip highlight while fresh
+    if (age < 1) {
+      ctx.save(); ctx.globalAlpha *= (1 - age) * .5; ctx.fillStyle = hexA(C.llm, .35);
+      rrect(x - 4, y - size * .9, w + 8, size * 1.2, 8); ctx.fill(); ctx.restore();
+    }
+    text(s, x, y, { size, weight: 700, color: hl ? C.warn : C.text, alpha: .4 + .6 * age });
+    x += w;
+  }
+  // cursor
+  if (Math.floor(t * 4) % 2 === 0 || n < TOKENS.length) {
+    ctx.save(); ctx.globalAlpha *= .9; ctx.fillStyle = C.llm; ctx.fillRect(x + 8, y - 42, 22, 52); ctx.restore();
+  }
+
+  // metrics row
+  const ma = eo(P(t, .5, .9));
+  const secs = Math.max(0, (t - .55) * 2.1).toFixed(1);
+  text(`⏱ 응답 대기 ${secs}s`, 140, 730, { size: 34, weight: 700, color: C.llm, alpha: ma });
+  text(`출력 토큰 ${n}개 · 순차 생성 · 토큰당 과금`, 520, 730, { size: 30, weight: 500, color: C.dim, alpha: ma });
+
+  // warnings
+  const warns = ['자유형 텍스트 → 파싱 필요', '애매한 답 · 환각 가능성', '느린 순차 생성'];
+  let wx = 140;
+  warns.forEach((w, i) => {
+    const u = P(t, 1.9 + i * .22, 2.25 + i * .22);
+    if (u <= 0) return;
+    ctx.save(); ctx.translate(0, 18 * (1 - eback(u)));
+    wx += pill('⚠ ' + w, wx, 800, { color: C.llm, size: 30, alpha: eo(u) }) + 22;
+    ctx.restore();
+  });
+  ctx.restore();
+}
+
+// ---------- transition sweep ----------
+function sweep(t) {
+  const u = P(t, 3.05, 3.65);
+  if (u <= 0 || u >= 1) return;
+  const x = lerp(-200, W + 200, eio(u));
+  ctx.save();
+  const g = ctx.createLinearGradient(x - 260, 0, x, 0);
+  g.addColorStop(0, 'rgba(61,245,200,0)'); g.addColorStop(1, 'rgba(61,245,200,0.35)');
+  ctx.fillStyle = g; ctx.fillRect(x - 260, 0, 260, H);
+  ctx.fillStyle = C.jev; ctx.shadowBlur = 40; ctx.shadowColor = C.jev; ctx.fillRect(x, 0, 4, H);
+  ctx.restore();
+}
+
+// ---------- Scene 2: Title (3.4 - 5.7) ----------
+function scene2(t) {
+  const a = env(t, 3.4, 5.7, .3, .4);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+  const cx = W / 2;
+  // rings
+  for (let i = 0; i < 3; i++) {
+    const u = ((t - 3.45) * .7 + i / 3) % 1;
+    if (t < 3.45) break;
+    ctx.save(); ctx.globalAlpha *= (1 - u) * .35; ctx.strokeStyle = C.jev; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, 540, 160 + u * 420, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+  }
+  text('TypeSafe AI', cx, 330, { size: 36, weight: 500, fam: MONO, color: C.dim, align: 'center', alpha: eo(P(t, 3.5, 3.9)) });
+  const s = lerp(.82, 1, eback(P(t, 3.55, 4.15)));
+  ctx.save(); ctx.translate(cx, 600); ctx.scale(s, s);
+  setFont(280, 900); ctx.textAlign = 'center';
+  ctx.globalAlpha *= eo(P(t, 3.55, 3.95));
+  ctx.shadowBlur = 60; ctx.shadowColor = hexA(C.jev, .6);
+  ctx.fillStyle = grad(-220, -200, 220, 0); ctx.fillText('Jev', 0, 0);
+  ctx.restore();
+  text('SYSTEM ONE MODEL', cx, 690, { size: 38, weight: 700, fam: MONO, color: C.jev, align: 'center', alpha: eo(P(t, 3.9, 4.3)) });
+  const ty = 810 + 20 * (1 - eo(P(t, 4.2, 4.7)));
+  rich([['텍스트를 생성하지 않고, ', C.text], ['결정', C.jev, 900], ['합니다.', C.text]], cx, ty,
+       { size: 62, weight: 700, align: 'center', alpha: eo(P(t, 4.2, 4.7)) });
+  ctx.restore();
+}
+
+// ---------- Scene 3: Mechanism (5.6 - 10.0) ----------
+function bars(x, y, w, items, u, chosenIdx) {
+  // horizontal probability bars
+  items.forEach(([label, p], i) => {
+    const yy = y + i * 34, best = i === chosenIdx;
+    text(label, x, yy + 20, { size: 22, weight: 500, fam: MONO, color: best ? C.text : C.dim });
+    const bx = x + 130, bw = w - 220;
+    ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.06)'; rrect(bx, yy + 6, bw, 16, 8); ctx.fill();
+    ctx.fillStyle = best ? grad(bx, 0, bx + bw, 0) : C.dim2; rrect(bx, yy + 6, Math.max(16, bw * p * u), 16, 8); ctx.fill(); ctx.restore();
+    text((p * u).toFixed(2), x + w - 10, yy + 21, { size: 22, weight: 700, fam: MONO, color: best ? C.jev : C.dim, align: 'right' });
+  });
+}
+function scene3(t) {
+  const a = env(t, 5.6, 10.0, .3, .4);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+
+  rich([['State in', C.text], ['  →  ', C.jev], ['Typed decisions out', C.text]], W / 2, 140,
+       { size: 48, weight: 700, fam: MONO, align: 'center', alpha: eo(P(t, 5.6, 6.0)) });
+
+  // input card
+  const iu = eo(P(t, 5.7, 6.2));
+  ctx.save(); ctx.translate(-80 * (1 - iu), 0);
+  const ix = 100, iy = 210, iw = 580, ih = 420;
+  card(ix, iy, iw, ih, { alpha: iu });
+  text('INPUT · 비정형 상태', ix + 32, iy + 52, { size: 26, weight: 700, color: C.dim, alpha: iu });
+  const lines = [
+    ['{', C.dim], ['  "from": "kim@acme.co",', C.text], ['  "subject":', C.text], ['    "결제가 두 번 됐어요",', C.warn],
+    ['  "body": "카드에서 2번', C.text], ['    빠져나갔어요. 빨리', C.text], ['    확인 부탁드려요!"', C.text], ['}', C.dim]
+  ];
+  lines.forEach(([l, col], i) => {
+    const lu = P(t, 5.85 + i * .06, 6.0 + i * .06);
+    text(l, ix + 32, iy + 108 + i * 40, { size: 25, weight: 500, fam: MONO, color: col, alpha: lu * iu });
+  });
+  ctx.restore();
+
+  // schema card
+  const su = eo(P(t, 6.0, 6.5));
+  ctx.save(); ctx.translate(-80 * (1 - su), 0);
+  const sx = 100, sy = 660, sw = 580, sh = 250;
+  card(sx, sy, sw, sh, { alpha: su, stroke: hexA(C.jev, .35) });
+  text('SCHEMA · 타입 질문', sx + 32, sy + 52, { size: 26, weight: 700, color: C.jev, alpha: su });
+  [['route', 'enum{billing|shipping|tech}'], ['urgent', 'bool'], ['sentiment', 'score(1–5)']].forEach(([k, v], i) => {
+    rich([[k, C.text], [': ', C.dim], [v, C.jev2]], sx + 32, sy + 110 + i * 46, { size: 25, weight: 500, fam: MONO, alpha: su });
+  });
+  ctx.restore();
+
+  // node
+  const nx = 960, ny = 520, nr = 105;
+  const nu = eback(P(t, 6.3, 6.9));
+  const pulse = 1 + .05 * Math.sin(t * 9) * P(t, 6.9, 7.5) * (1 - P(t, 7.5, 8));
+  // connections in
+  const lin = P(t, 6.4, 7.0);
+  const cIn1 = curve([ix + iw, 420], [nx - nr, ny - 20], lin * .8, hexA(C.jev, .5), lin);
+  const cIn2 = curve([sx + sw, 785], [nx - nr, ny + 20], lin * .8, hexA(C.jev, .5), lin);
+  // outputs geometry
+  const ox = 1260, ow = 560, oh = 205, oys = [210, 440, 670];
+  const lout = P(t, 7.35, 7.6);
+  const outs = oys.map(oy => curve([nx + nr, ny], [ox, oy + oh / 2], lout * .8, hexA(C.jev, .5), lout));
+  // particles in
+  if (t > 6.8 && t < 7.6) {
+    for (let k = 0; k < 6; k++) {
+      const u = ((t - 6.8) * 1.6 + k / 6) % 1;
+      const p1 = cIn1(u), p2 = cIn2(u);
+      dot(p1[0], p1[1], 5, C.jev, 1 - P(t, 7.4, 7.6)); dot(p2[0], p2[1], 5, C.jev2, 1 - P(t, 7.4, 7.6));
+    }
+  }
+  // single parallel burst out (all at once)
+  const bu = P(t, 7.35, 7.75);
+  if (bu > 0 && bu < 1) outs.forEach(f => { const p = f(eo(bu)); dot(p[0], p[1], 8, C.jev); });
+
+  ctx.save(); ctx.translate(nx, ny); ctx.scale(nu * pulse, nu * pulse);
+  ctx.globalAlpha *= clamp(nu);
+  ctx.shadowBlur = 70; ctx.shadowColor = hexA(C.jev, .7);
+  ctx.beginPath(); ctx.arc(0, 0, nr, 0, Math.PI * 2); ctx.fillStyle = grad(-nr, -nr, nr, nr); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.beginPath(); ctx.arc(0, 0, nr - 10, 0, Math.PI * 2); ctx.fillStyle = '#081018'; ctx.fill();
+  setFont(64, 900); ctx.textAlign = 'center'; ctx.fillStyle = grad(-60, -40, 60, 20); ctx.fillText('Jev', 0, 22);
+  ctx.restore();
+  text('1-pass · 병렬 추론', nx, ny + nr + 54, { size: 28, weight: 700, color: C.text, align: 'center', alpha: eo(P(t, 6.7, 7.1)) });
+  // latency badge
+  const lu = eback(P(t, 7.4, 7.8));
+  if (lu > 0) {
+    ctx.save(); ctx.translate(nx, ny - nr - 60); ctx.scale(lu, lu);
+    pill('⚡ ≈ 0.1s', 0, -24, { size: 30, color: C.jev, fam: MONO, align: 'center' });
+    ctx.restore();
+  }
+
+  // output cards — appear simultaneously
+  const ou = eo(P(t, 7.45, 7.85)), fill = eo(P(t, 7.6, 8.4));
+  const outDefs = [
+    { k: 'route', type: 'enum', val: 'billing', p: .96, kind: 'bar', items: [['billing', .96], ['shipping', .03], ['tech', .01]], ci: 0 },
+    { k: 'urgent', type: 'bool', val: 'true', p: .91, kind: 'bar', items: [['true', .91], ['false', .09]], ci: 0 },
+    { k: 'sentiment', type: 'score', val: '2 / 5', p: .84, kind: 'col', items: [.06, .84, .07, .02, .01], ci: 1 }
+  ];
+  outDefs.forEach((d, i) => {
+    const oy = oys[i];
+    ctx.save(); ctx.translate(60 * (1 - ou), 0);
+    card(ox, oy, ow, oh, { alpha: ou, stroke: hexA(C.jev, .45), glow: 30 * ou, glowColor: hexA(C.jev, .25) });
+    ctx.globalAlpha *= ou;
+    rich([[d.k, C.text], ['  ' + d.type, C.dim, 500]], ox + 30, oy + 48, { size: 26, weight: 700, fam: MONO });
+    text(d.val, ox + ow - 30, oy + 52, { size: 38, weight: 700, fam: MONO, color: C.jev, align: 'right' });
+    if (d.kind === 'bar') bars(ox + 30, oy + 78, ow - 30, d.items, fill, d.ci);
+    else {
+      d.items.forEach((p, j) => {
+        const cw = 56, gap = 20, bx = ox + 40 + j * (cw + gap), base = oy + oh - 24, hmax = 90;
+        ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.06)'; rrect(bx, base - hmax, cw, hmax, 8); ctx.fill();
+        const hh = Math.max(8, hmax * p * fill);
+        ctx.fillStyle = j === d.ci ? grad(0, base - hmax, 0, base, C.jev, C.jev2) : C.dim2; rrect(bx, base - hh, cw, hh, 8); ctx.fill(); ctx.restore();
+        text(String(j + 1), bx + cw / 2, base - hmax - 6, { size: 20, weight: 700, fam: MONO, color: j === d.ci ? C.jev : C.dim, align: 'center' });
+      });
+      text('p=' + (d.p * fill).toFixed(2), ox + ow - 30, oy + oh - 30, { size: 24, weight: 700, fam: MONO, color: C.jev, align: 'right' });
+    }
+    ctx.restore();
+  });
+  text('3개 결정 · 동시 출력', ox + ow / 2, 920, { size: 28, weight: 700, color: C.jev, align: 'center', alpha: eo(P(t, 7.9, 8.3)) });
+
+  // caption
+  const ca = eo(P(t, 8.2, 8.7));
+  rich([['비정형 상태 → ', C.text], ['타입이 보장된 값', C.jev], [' + ', C.text], ['보정된 확률', C.jev], ['을 한 번에', C.text]],
+       W / 2, 1015, { size: 40, weight: 700, align: 'center', alpha: ca });
+  ctx.restore();
+}
+
+// ---------- Scene 4: Comparison (9.9 - 13.0) ----------
+function scene4(t) {
+  const a = env(t, 9.9, 13.0, .3, .4);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+  text('무엇이 다른가', W / 2, 150, { size: 64, weight: 900, align: 'center', alpha: eo(P(t, 9.9, 10.3)) });
+
+  const lx = 170, c1 = 600, c2 = 1150, top = 220, rowH = 116;
+  const rows = [
+    ['출력 방식', '토큰 순차 생성 (텍스트)', '병렬 1-pass · 타입 값'],
+    ['응답 속도', '수 초 ~ 수십 초', '70–500ms · 40–200× ↑'],
+    ['출력 비용', '입력 단가의 ~5배', '출력 토큰 무료'],
+    ['환각 · 타입 오류', '발생 가능', '0% · 스키마 밖 출력 불가'],
+    ['신뢰도', '과신 · 불일치', '보정된 확률 동반']
+  ];
+  const ha = eo(P(t, 10.0, 10.4));
+  // jev column highlight
+  const hl = eo(P(t, 10.1, 10.6));
+  card(c2 - 30, top - 10, 640, 100 + rows.length * rowH, { alpha: hl, fill: hexA(C.jev, .06), stroke: hexA(C.jev, .55), glow: 40, glowColor: hexA(C.jev, .25), r: 26 });
+  text('기존 LLM', c1, top + 58, { size: 36, weight: 900, color: C.llm, alpha: ha });
+  text('TypeSafe Jev', c2, top + 58, { size: 36, weight: 900, color: C.jev, alpha: ha });
+
+  rows.forEach(([k, l, j], i) => {
+    const u = eo(P(t, 10.25 + i * .28, 10.6 + i * .28));
+    if (u <= 0) return;
+    const y = top + 100 + i * rowH;
+    ctx.save(); ctx.globalAlpha *= u; ctx.translate(0, 20 * (1 - u));
+    ctx.fillStyle = 'rgba(255,255,255,0.07)'; ctx.fillRect(lx, y, c2 + 610 - lx - 30, 2);
+    text(k, lx, y + 70, { size: 34, weight: 700, color: C.dim });
+    text('✕  ' + l, c1, y + 70, { size: 34, weight: 500, color: '#B9A8A6' });
+    text('✓  ' + j, c2, y + 70, { size: 36, weight: 700, color: C.text });
+    ctx.restore();
+  });
+  text('※ 수치는 TypeSafe AI 공개 자료(2026.09 Early Access) 기준 벤더 발표값', W / 2, 1030,
+       { size: 24, weight: 400, color: C.dim, align: 'center', alpha: eo(P(t, 11.0, 11.5)) });
+  ctx.restore();
+}
+
+// ---------- Scene 5: Use cases + end card (12.9 - 15) ----------
+function scene5(t) {
+  const a = env(t, 12.9, 15.5, .3, .1);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a;
+  rich([['어디에 쓰나  ', C.text, 900], ['— 답이 정해진 대량·반복 의사결정', C.dim, 700]], W / 2, 220,
+       { size: 50, align: 'center', alpha: eo(P(t, 12.9, 13.3)) });
+  const chips = [['티켓·요청 라우팅', '실시간 워크플로 분기', 'LLM 출력 가드레일'], ['분류 · 스코어링 · 추출', '대규모 데이터 처리']];
+  let idx = 0;
+  chips.forEach((row, r) => {
+    const size = 36, padX = 34, gap = 26;
+    const widths = row.map(s => measure(s, size) + padX * 2);
+    let x = W / 2 - (widths.reduce((s, w) => s + w, 0) + gap * (row.length - 1)) / 2;
+    row.forEach((s, i) => {
+      const u = P(t, 13.1 + idx * .1, 13.5 + idx * .1); idx++;
+      if (u > 0) {
+        const sc = eback(u), cx = x + widths[i] / 2, cy = 300 + r * 100 + 32;
+        ctx.save(); ctx.translate(cx, cy); ctx.scale(sc, sc); ctx.translate(-cx, -cy);
+        pill(s, x, 300 + r * 100, { size, padX, color: C.jev, alpha: clamp(u * 2) });
+        ctx.restore();
+      }
+      x += widths[i] + gap;
+    });
+  });
+
+  // end card
+  const ea = eo(P(t, 13.7, 14.2));
+  ctx.save(); ctx.globalAlpha *= ea;
+  ctx.fillStyle = grad(W / 2 - 300, 0, W / 2 + 300, 0); ctx.fillRect(W / 2 - 300 * ea, 560, 600 * ea, 3);
+  ctx.restore();
+  rich([['Unstructured state in ', C.text], ['→', C.jev], [' Typed decisions out', C.text]], W / 2, 670,
+       { size: 46, weight: 700, fam: MONO, align: 'center', alpha: ea });
+  const ts = lerp(.9, 1, eback(P(t, 13.9, 14.4)));
+  ctx.save(); ctx.translate(W / 2, 820); ctx.scale(ts, ts); ctx.globalAlpha *= eo(P(t, 13.9, 14.3));
+  setFont(110, 900); ctx.textAlign = 'center'; ctx.shadowBlur = 50; ctx.shadowColor = hexA(C.jev, .5);
+  ctx.fillStyle = grad(-380, 0, 380, 0); ctx.fillText('TypeSafe Jev', 0, 0); ctx.restore();
+  rich([['대화·코드 생성은 ', C.dim], ['LLM', C.llm], [',  빠르고 정확한 결정은 ', C.dim], ['Jev', C.jev]], W / 2, 910,
+       { size: 36, weight: 700, align: 'center', alpha: eo(P(t, 14.15, 14.55)) });
+  ctx.restore();
+}
+
+function progress(t) {
+  ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(0, H - 6, W, 6);
+  ctx.fillStyle = t < 3.3 ? C.llm : C.jev; ctx.fillRect(0, H - 6, W * (t / DUR), 6);
+}
+
+window.render = function (t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
+  background(t);
+  scene1(t); scene2(t); scene3(t); scene4(t); scene5(t);
+  sweep(t); progress(t);
+};
+window.ready = loadFonts().then(() => { window.render(0); return true; });
+// preview mode: open the file in a browser to watch it loop in real time
+if (!location.search.includes('capture')) {
+  window.ready.then(() => { const t0 = performance.now(); (function loop() { window.render(((performance.now() - t0) / 1000) % DUR); requestAnimationFrame(loop); })(); });
+}
+</script>
+</body></html>
