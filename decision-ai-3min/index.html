@@ -1,0 +1,1126 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#070A12}canvas{display:block}</style>
+</head><body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Decision AI — 3-minute combined cut (TypeSafe Jev explainer + Byline Network "Decision AI war")
+// Same design system as the 15s TypeSafe Jev explainer (palette, fonts, grid, cards, pills).
+const W = 1920, H = 1080;
+let LIVE = 0; // master clock for ambient motion (marquees keep moving during holds)
+const ctx = document.getElementById('c').getContext('2d');
+const C = {
+  bg: '#070A12', text: '#EEF2F8', dim: '#7A859E', dim2: '#4A5470',
+  jev: '#3DF5C8', jev2: '#2BB8FF', llm: '#FF6B5A', warn: '#FFB547',
+  card: 'rgba(20,28,46,0.92)', stroke: 'rgba(255,255,255,0.10)'
+};
+const KR = 'NotoKR', MONO = 'JBMono';
+
+async function loadFonts() {
+  const list = [
+    [KR, 'fonts/kr400.ttf', '400'], [KR, 'fonts/kr700.ttf', '700'], [KR, 'fonts/kr900.ttf', '900'],
+    [MONO, 'fonts/mono500.ttf', '500'], [MONO, 'fonts/mono700.ttf', '700']
+  ];
+  for (const [fam, url, weight] of list) {
+    const f = new FontFace(fam, `url(${url})`, { weight });
+    await f.load(); document.fonts.add(f);
+  }
+}
+
+// ---------- math / easing ----------
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, u) => a + (b - a) * u;
+const P = (t, a, b) => clamp((t - a) / (b - a));
+const eo = u => 1 - Math.pow(1 - u, 3);
+const eio = u => u < .5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+const expo = u => u >= 1 ? 1 : 1 - Math.pow(2, -10 * u);
+const ein = u => u * u * u;
+const eback = u => { const c1 = 2.2, c3 = c1 + 1; return 1 + c3 * Math.pow(u - 1, 3) + c1 * Math.pow(u - 1, 2); };
+const env = (t, a, b, fi = .3, fo = .3) => eo(P(t, a, a + fi)) * (1 - eio(P(t, b - fo, b)));
+const rnd = i => { const x = Math.sin(i * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); };
+const GLYPHS = 'ABCDEFGHJKLMNPQRSTUVWXYZ0123456789#%&<>/=+*?';
+
+function hexRGB(hex) { const n = parseInt(hex.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+function hexA(hex, a) { const [r, g, b] = hexRGB(hex); return `rgba(${r},${g},${b},${a})`; }
+function mix(a, b, u) { const A = hexRGB(a), B = hexRGB(b); return `rgb(${A.map((v, i) => Math.round(lerp(v, B[i], u))).join(',')})`; }
+
+// ---------- drawing primitives ----------
+function setFont(size, weight = 700, fam = KR) { ctx.font = `${weight} ${size}px ${fam}`; }
+function measure(s, size, weight = 700, fam = KR) { setFont(size, weight, fam); return ctx.measureText(s).width; }
+function text(s, x, y, o = {}) {
+  const { size = 40, weight = 700, color = C.text, align = 'left', alpha = 1, fam = KR, glow = 0, glowColor } = o;
+  ctx.save(); setFont(size, weight, fam);
+  ctx.textAlign = align; ctx.globalAlpha *= alpha; ctx.fillStyle = color;
+  if (glow) { ctx.shadowBlur = glow; ctx.shadowColor = glowColor || color; }
+  ctx.fillText(s, x, y); ctx.restore();
+}
+function rrect(x, y, w, h, r) {
+  r = Math.min(r, h / 2, w / 2);
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function card(x, y, w, h, o = {}) {
+  const { alpha = 1, stroke = C.stroke, fill = C.card, r = 22, glow = 0, glowColor } = o;
+  ctx.save(); ctx.globalAlpha *= alpha; rrect(x, y, w, h, r);
+  if (glow) { ctx.shadowBlur = glow; ctx.shadowColor = glowColor; }
+  ctx.fillStyle = fill; ctx.fill(); ctx.shadowBlur = 0; ctx.lineWidth = 2; ctx.strokeStyle = stroke; ctx.stroke();
+  ctx.restore();
+}
+function pill(label, x, y, o = {}) {
+  const { size = 26, color = C.jev, alpha = 1, fam = KR, weight = 700, padX = 22, align = 'left' } = o;
+  const h = size * 1.75, w = measure(label, size, weight, fam) + padX * 2;
+  const px = align === 'center' ? x - w / 2 : x;
+  ctx.save(); ctx.globalAlpha *= alpha; rrect(px, y, w, h, h / 2);
+  ctx.fillStyle = hexA(color, .14); ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = hexA(color, .8); ctx.stroke(); ctx.restore();
+  text(label, px + padX, y + h / 2 + size * .36, { size, weight, color, alpha, fam });
+  return w;
+}
+function grad(x0, y0, x1, y1, a = C.jev, b = C.jev2) {
+  const g = ctx.createLinearGradient(x0, y0, x1, y1); g.addColorStop(0, a); g.addColorStop(1, b); return g;
+}
+
+// ---------- KINETIC TYPE ENGINE ----------
+// Per-character animation: stagger, slam, skew-in, scramble-decode, motion trail, tracking, outro.
+function kin(segs, x, y, o) {
+  const {
+    t, t0 = 0, size = 80, weight = 900, fam = KR, align = 'center', stagger = .03, dur = .5, ease = expo,
+    from = {}, scramble = 0, spacing = 0, out = null, glow = 0, glowColor, gradient = null, alpha = 1,
+    trail = 0, stroke = 0, maxW = 0
+  } = o;
+  if (alpha <= 0) return { w: 0, x0: x, size };
+  if (typeof segs === 'string') segs = [[segs, o.color || C.text]];
+  const chars = [];
+  for (const [s, col, w] of segs) for (const ch of [...s]) chars.push({ ch, col, w: w || weight });
+  let fs = size;
+  const lay = () => {
+    let total = 0;
+    for (const c of chars) { setFont(fs, c.w, fam); c.adv = ctx.measureText(c.ch).width; c.x = total; total += c.adv + spacing; }
+    return total - spacing;
+  };
+  let total = lay();
+  if (maxW && total > maxW) { fs = size * maxW / total; total = lay(); }
+  const x0 = align === 'center' ? x - total / 2 : align === 'right' ? x - total : x;
+  const n = chars.length;
+  const state = (i, tt) => {
+    const st = t0 + i * stagger, u = P(tt, st, st + dur);
+    const e = ease(u);
+    const s = {
+      u, dx: (from.dx || 0) * (1 - e), dy: (from.dy || 0) * (1 - e),
+      sc: lerp(from.scale ?? 1, 1, e), rot: (from.rot || 0) * (1 - e), sk: (from.skew || 0) * (1 - e),
+      a: from.alpha === 1 ? 1 : clamp(e * 1.6)
+    };
+    if (out) {
+      const os = out.t0 + i * (out.stagger || 0), v = ein(P(tt, os, os + (out.dur || .3)));
+      s.dx += (out.dx || 0) * v; s.dy += (out.dy || 0) * v; s.sc *= lerp(1, out.scale ?? 1, v);
+      s.sk += (out.skew || 0) * v; s.rot += (out.rot || 0) * v; s.a *= 1 - v;
+    }
+    return s;
+  };
+  chars.forEach((c, i) => {
+    if (c.ch === ' ') return;
+    const col = gradient ? mix(gradient[0], gradient[1], n > 1 ? i / (n - 1) : 0) : c.col;
+    const passes = trail ? [3, 2, 1, 0] : [0];
+    for (const k of passes) {
+      const s = state(i, t - k * .028);
+      if (s.u <= 0 || s.a <= 0) continue;
+      const st = t0 + i * stagger;
+      const scr = scramble && t < st + scramble;
+      const glyph = scr ? GLYPHS[Math.floor(rnd(i * 13 + Math.floor(t * 30)) * GLYPHS.length)] : c.ch;
+      ctx.save();
+      ctx.globalAlpha *= clamp(alpha) * s.a * (k ? .16 / k : 1);
+      ctx.translate(x0 + c.x + c.adv / 2 + s.dx, y + s.dy);
+      if (s.rot) ctx.rotate(s.rot);
+      if (s.sk) ctx.transform(1, 0, s.sk, 1, 0, 0);
+      if (s.sc !== 1) ctx.scale(s.sc, s.sc);
+      setFont(fs, scr ? 700 : c.w, scr ? MONO : fam); ctx.textAlign = 'center';
+      if (glow && !k) { ctx.shadowBlur = glow; ctx.shadowColor = glowColor || col; }
+      if (stroke) { ctx.lineWidth = stroke; ctx.strokeStyle = scr ? C.jev : col; ctx.strokeText(glyph, 0, 0); }
+      else { ctx.fillStyle = scr ? C.jev : col; ctx.fillText(glyph, 0, 0); }
+      ctx.restore();
+    }
+  });
+  return { w: total, x0, size: fs };
+}
+// masked slide (text emerges from behind an invisible line)
+function maskSlide(s, x, y, o) {
+  const { t, t0, dur = .4, size = 100, dir = 1, out = null } = o;
+  const u = expo(P(t, t0, t0 + dur));
+  let off = (1 - u) * size * 1.2 * dir;
+  if (out) off -= ein(P(t, out.t0, out.t0 + (out.dur || .3))) * size * 1.2 * (out.dir || 1);
+  ctx.save(); ctx.beginPath(); ctx.rect(0, y - size * 1.05, W, size * 1.35); ctx.clip();
+  kin(s, x, y + off, { ...o, t: 1e9, t0: 0, from: {} });
+  ctx.restore();
+}
+// marquee row of big outlined/filled type
+function marquee(str, y, o) {
+  const { t, speed = 120, size = 160, weight = 900, fam = KR, color = C.text, alpha = .1, stroke = 2, dir = 1 } = o;
+  setFont(size, weight, fam);
+  const w = ctx.measureText(str).width;
+  let x = ((LIVE * speed * dir) % w + w) % w - w;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.textAlign = 'left';
+  for (; x < W; x += w) {
+    if (stroke) { ctx.lineWidth = stroke; ctx.strokeStyle = color; ctx.strokeText(str, x, y); }
+    else { ctx.fillStyle = color; ctx.fillText(str, x, y); }
+  }
+  ctx.restore();
+}
+
+// ---------- background (identical to the 15s piece) ----------
+function background(t) {
+  ctx.fillStyle = C.bg; ctx.fillRect(-50, -50, W + 100, H + 100);
+  ctx.save(); ctx.strokeStyle = 'rgba(120,150,200,0.06)'; ctx.lineWidth = 1;
+  const s = 80, off = (t * 12) % s;
+  for (let x = -s + off; x < W + s; x += s) { ctx.beginPath(); ctx.moveTo(x, -50); ctx.lineTo(x, H + 50); ctx.stroke(); }
+  for (let y = -s + off * .5; y < H + s; y += s) { ctx.beginPath(); ctx.moveTo(-50, y); ctx.lineTo(W + 50, y); ctx.stroke(); }
+  ctx.restore();
+  const cx = W * .5 + Math.sin(t * .6) * 220, cy = H * .5 + Math.cos(t * .5) * 90;
+  const g2 = ctx.createRadialGradient(cx, cy, 0, cx, cy, 1000);
+  g2.addColorStop(0, hexA(C.jev, .085)); g2.addColorStop(.5, hexA(C.jev2, .04)); g2.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g2; ctx.fillRect(0, 0, W, H);
+  // warm wash when LLM is on screen
+  const warm = env(t, 6.0, 7.2, .3, .5) * .6;
+  if (warm > 0) {
+    const g1 = ctx.createRadialGradient(W * .3, H * .5, 0, W * .3, H * .5, 900);
+    g1.addColorStop(0, hexA(C.llm, .10 * warm)); g1.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g1; ctx.fillRect(0, 0, W, H);
+  }
+}
+function vignette() {
+  const v = ctx.createRadialGradient(W / 2, H / 2, 400, W / 2, H / 2, 1200);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.55)');
+  ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+}
+
+
+// ================= MODULE W =================
+const MOD_W = (() => {
+// ---------- camera impacts (shake + flash) ----------
+const IMPACTS = [];
+const impact = (t, s = 1, color = C.jev) => IMPACTS.push({ t, s, color });
+function camera(t) {
+  let x = 0, y = 0;
+  for (const im of IMPACTS) {
+    const d = t - im.t; if (d < 0 || d > .45) continue;
+    const amp = 22 * im.s * Math.exp(-d * 11);
+    x += Math.sin(d * 95 + im.t * 7) * amp; y += Math.cos(d * 83 + im.t * 3) * amp * .7;
+  }
+  return [x, y];
+}
+function flash(t) {
+  for (const im of IMPACTS) {
+    const d = t - im.t; if (d < 0 || d > .3) continue;
+    ctx.save(); ctx.globalAlpha = .16 * im.s * Math.exp(-d * 14);
+    ctx.fillStyle = im.color; ctx.fillRect(0, 0, W, H); ctx.restore();
+  }
+}
+
+
+
+
+// S1 (0 – 3.2) Hook: "2주." → brands slam in → "참전."
+impact(.42, 1.2); impact(1.62, .6); impact(1.92, .6); impact(2.22, .6); impact(2.52, .6); impact(2.82, 1.1, C.llm);
+function s1(t) {
+  if (t > 3.3) return;
+  // part A: 2주
+  const aA = 1 - eio(P(t, 1.42, 1.58));
+  if (aA > 0) {
+    ctx.save(); ctx.globalAlpha *= aA;
+    kin('BREAKING · DECISION AI', W / 2, 250, { t, t0: .05, size: 30, weight: 700, fam: MONO, color: C.jev, stagger: .018, dur: .3, scramble: .35, spacing: lerp(4, 14, eo(P(t, 0, 1.4))) });
+    // echo rings of the number
+    for (let k = 1; k <= 3; k++) {
+      const u = P(t, .42 + k * .05, 1.2 + k * .05);
+      if (u > 0 && u < 1) kin('2주', W / 2, 640, { t: 9, size: 420 * (1 + eo(u) * .35 * k / 2), stroke: 2, color: C.jev, alpha: (1 - u) * .5 });
+    }
+    kin('2주', W / 2, 640, { t, t0: .25, size: 420, stagger: .08, dur: .35, from: { scale: 3.2, dy: -40 }, gradient: [C.text, C.jev], glow: 50, glowColor: hexA(C.jev, .5) });
+    kin([['Jev', C.jev], [' 등장 후, ', C.text], ['단 2주 만에', C.text]], W / 2, 810, { t, t0: .75, size: 60, weight: 700, stagger: .022, dur: .4, from: { dy: 50 } });
+    ctx.restore();
+  }
+  // part B: brands rapid cuts
+  const brands = [['OpenAI', { dx: -500, skew: .5 }], ['AWS', { dx: 500, skew: -.5 }], ['Cloudflare', { dy: -260 }], ['NVIDIA', { scale: 2.6 }]];
+  brands.forEach(([b, from], i) => {
+    const t0 = 1.55 + i * .3, t1 = t0 + .3;
+    if (t < t0 || t > t1 + .02) return;
+    marquee(`${b}  ·  ${b}  ·  ${b}  ·  `, 300, { t, size: 120, fam: MONO, weight: 700, speed: 900 * (i % 2 ? -1 : 1), alpha: .07, stroke: 2, color: C.jev });
+    marquee(`${b}  ·  ${b}  ·  ${b}  ·  `, 900, { t, size: 120, fam: MONO, weight: 700, speed: 900 * (i % 2 ? 1 : -1), alpha: .07, stroke: 2, color: C.jev });
+    kin(b, W / 2, 610, { t, t0, size: 250, weight: 900, stagger: .012, dur: .16, from, trail: 1, gradient: [C.text, C.jev2] });
+    text(`0${i + 1}`, 140, 1000, { size: 30, fam: MONO, color: C.dim });
+  });
+  // part C: 참전.
+  if (t >= 2.75) {
+    kin('참전.', W / 2, 660, { t, t0: 2.75, size: 330, stagger: .06, dur: .25, from: { scale: 2.8 }, color: C.text, glow: 40, glowColor: hexA(C.llm, .6),
+      out: { t0: 3.05, dur: .18, scale: .6, dy: -60 } });
+  }
+}
+
+// S2 (3.2 – 6.0) Headline
+impact(4.2, 1.3);
+function s2(t) {
+  const a = env(t, 3.15, 6.05, .15, .25);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  marquee('DECISION AI WAR  ·  DECISION AI WAR  ·  ', 250, { t, size: 210, fam: MONO, weight: 700, speed: 140, alpha: .07 });
+  marquee('디시전 AI 전쟁  ·  디시전 AI 전쟁  ·  ', 1010, { t, size: 210, speed: -140, alpha: .07 });
+  const out = (d = 0) => ({ t0: 5.55 + d, dur: .3, dy: -120, stagger: .008 });
+  kin([['오픈AI', C.text], ['・', C.dim], ['AWS', C.text], ['도 참전,', C.text]], W / 2, 400,
+      { t, t0: 3.3, size: 62, weight: 700, stagger: .025, dur: .35, from: { dy: -70, rot: -.3 }, out: out(0) });
+  kin([['Jev', C.jev], ['가 터뜨린', C.text]], W / 2, 545,
+      { t, t0: 3.6, size: 104, weight: 900, stagger: .035, dur: .4, scramble: .3, from: { dy: 40 }, out: out(.04) });
+  const r = kin([["'디시전 AI'", C.jev], [' 전쟁', C.text]], W / 2, 735,
+      { t, t0: 3.95, size: 180, weight: 900, stagger: .045, dur: .3, from: { scale: 2.4 }, glow: 30, glowColor: hexA(C.jev, .35), out: out(.08) });
+  // underline wipe
+  const uw = expo(P(t, 4.35, 4.85)) * (1 - ein(P(t, 5.55, 5.8)));
+  ctx.save(); ctx.fillStyle = grad(W / 2 - r.w / 2, 0, W / 2 + r.w / 2, 0); ctx.shadowBlur = 25; ctx.shadowColor = C.jev;
+  ctx.fillRect(W / 2 - r.w / 2, 775, r.w * uw, 8); ctx.restore();
+  kin('byline.network  ·  김우용 기자  ·  2026.10.02', W / 2, 860, { t, t0: 4.6, size: 28, weight: 500, fam: MONO, color: C.dim, stagger: .01, dur: .2, scramble: .25, out: out(.1) });
+  ctx.restore();
+}
+
+// S3a (6.0 – 7.6) Word swap: LLM은 생성한다 → Jev는 판단한다
+impact(6.85, .8);
+function s3a(t) {
+  const a = env(t, 6.0, 7.65, .2, .2);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  const swap = 6.8;
+  // top label swap
+  maskSlide('TOKENS', W / 2, 330, { t, t0: 6.05, size: 40, fam: MONO, weight: 700, color: C.llm, out: { t0: swap, dur: .2 } });
+  maskSlide('PROBABILITIES', W / 2, 330, { t, t0: swap + .05, size: 40, fam: MONO, weight: 700, color: C.jev });
+  const y = 590, size = 150;
+  // subject
+  if (t < swap) kin('LLM은', 700, y, { t, t0: 6.05, size, weight: 900, color: C.llm, align: 'right', stagger: .04, dur: .35, from: { dx: -100, skew: .4 } });
+  else kin('Jev는', 700, y, { t, t0: swap, size, weight: 900, color: C.jev, align: 'right', stagger: .03, dur: .2, scramble: .2, from: { alpha: 1 } });
+  // verb with mask swap
+  maskSlide('생성한다', 760, y, { t, t0: 6.2, size, weight: 900, color: C.text, align: 'left', out: { t0: swap, dur: .2 } });
+  if (t < swap + .1) {
+    const sw = expo(P(t, 6.5, 6.75));
+    ctx.save(); ctx.fillStyle = C.llm; ctx.globalAlpha *= 1 - P(t, swap, swap + .1);
+    ctx.fillRect(750, y - 55, measure('생성한다', size, 900) * sw + 20, 12); ctx.restore();
+  }
+  maskSlide('판단한다', 760, y, { t, t0: swap + .05, size, weight: 900, color: C.jev, align: 'left', glow: 30 });
+  kin('자연어 토큰 대신, 선택지별 보정된 확률을 출력', W / 2, 760, { t, t0: 7.0, size: 44, weight: 700, color: C.dim, stagger: .012, dur: .3, from: { dy: 30 } });
+  ctx.restore();
+}
+
+// S3b (7.6 – 11.2) Number slams
+const NUMS = [
+  { v: 193.6, fmt: v => v.toFixed(1) + '×', label: '더 빠르게', sub: '응답 3–329s → 70–500ms (vs 프런티어 모델)' },
+  { v: 444.6, fmt: v => v.toFixed(1) + '×', label: '더 저렴하게', sub: '프런티어 모델 대비 · 회사 측 주장' },
+  { v: 7, fmt: v => '$' + v.toFixed(0) + '/h', label: '초당 10쿼리 · 둠 게임 데모', sub: '공개 데모 기준 시간당 약 7달러' }
+];
+NUMS.forEach((_, k) => impact(7.62 + k * .9, 1));
+function s3b(t) {
+  const N5 = NUMS.length, END5 = 7.6 + N5 * .9;
+  if (t < 7.55 || t > END5 + .1) return;
+  const k = clamp(Math.floor((t - 7.6) / .9), 0, N5 - 1), t0 = 7.6 + k * .9, t1 = t0 + .9, d = NUMS[k];
+  const last = k === N5 - 1;
+  const outU = last ? ein(P(t, END5 - .15, END5 + .05)) : ein(P(t, t1 - .14, t1));
+  // giant number slam with roll-up counter
+  const u = expo(P(t, t0, t0 + .3)), cnt = d.v * eo(P(t, t0, t0 + .45));
+  const sc = lerp(2.2, 1, u) * lerp(1, .85, outU);
+  ctx.save(); ctx.globalAlpha *= clamp(u * 2) * (1 - outU);
+  ctx.translate(W / 2, 600 - outU * 160); ctx.scale(sc, sc);
+  setFont(300, 700, MONO); ctx.textAlign = 'center';
+  for (let j = 3; j >= 1; j--) { // motion echo
+    ctx.save(); ctx.globalAlpha *= .1 * (1 - u); ctx.scale(1 + j * .08, 1 + j * .08); ctx.fillStyle = C.jev; ctx.fillText(d.fmt(cnt), 0, 0); ctx.restore();
+  }
+  ctx.shadowBlur = 60; ctx.shadowColor = hexA(C.jev, .55); ctx.fillStyle = grad(-500, -200, 500, 0); ctx.fillText(d.fmt(cnt), 0, 0);
+  ctx.restore();
+  ctx.save(); ctx.globalAlpha *= 1 - outU;
+  kin(d.label, W / 2, 770, { t, t0: t0 + .12, size: 72, weight: 900, stagger: .025, dur: .3, from: { dy: 60, skew: -.3 } });
+  kin(d.sub, W / 2, 850, { t, t0: t0 + .22, size: 30, weight: 500, fam: d.sub.match(/^[a-z0-9]/i) ? MONO : KR, color: C.dim, stagger: .006, dur: .2, scramble: .15 });
+  text(`0${k + 1} / 0${N5}`, 140, 1000, { size: 30, weight: 700, fam: MONO, color: C.jev });
+  text('※ 타입세이프AI 발표 기준', W - 140, 1000, { size: 24, weight: 400, color: C.dim, align: 'right' });
+  ctx.restore();
+}
+
+// S4 (11.2 – 14.0) Agent architecture splits
+impact(11.95, .9);
+function s4(t) {
+  const a = env(t, 11.2, 14.05, .2, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  kin('에이전트 아키텍처가 갈라진다', W / 2, 190, { t, t0: 11.25, size: 76, weight: 900, stagger: .025, dur: .35, from: { dy: -60, rot: .2 } });
+  const s = expo(P(t, 11.9, 12.4));
+  const blocks = [
+    { cx: 380, title: '판단 모델', tag: 'Jev · DECISION', desc: '분류 · 라우팅 · 점수화', col: C.jev },
+    { cx: 960, title: '추론 모델', tag: 'LLM · REASONING', desc: '분석 · 계획 · 복합 추론', col: C.llm },
+    { cx: 1540, title: '도구', tag: 'TOOLS', desc: 'API · 실행', col: C.dim }
+  ];
+  const by = 330, bh = 330;
+  if (s < 1) { // merged block
+    const mu = eo(P(t, 11.4, 11.7));
+    card(W / 2 - 520, by, 1040, bh, { alpha: mu * (1 - s), stroke: hexA(C.llm, .6) });
+    kin([['AI 에이전트 = ', C.text], ['LLM', C.llm]], W / 2, by + bh / 2 + 30, { t, t0: 11.45, size: 84, weight: 900, stagger: .03, dur: .3, alpha: 1 - s * 1.5 });
+  }
+  blocks.forEach((b, i) => {
+    if (s <= 0) return;
+    const w = lerp(1040 / 3, 500, s), x = lerp(W / 2 - 520 + i * 1040 / 3, b.cx - 250, s);
+    card(x, by, w, bh, { stroke: hexA(b.col, .7), glow: i === 0 ? 50 * s : 0, glowColor: hexA(C.jev, .35), fill: i === 0 ? 'rgba(18,40,46,0.92)' : C.card });
+    const t0 = 12.25 + i * .12;
+    kin(b.tag, b.cx, by + 80, { t, t0, size: 26, weight: 700, fam: MONO, color: b.col, stagger: .012, dur: .2, scramble: .2 });
+    kin(b.title, b.cx, by + 185, { t, t0: t0 + .05, size: 78, weight: 900, color: i === 2 ? C.text : b.col, stagger: .04, dur: .3, from: { scale: 1.8 } });
+    kin(b.desc, b.cx, by + 260, { t, t0: t0 + .15, size: 32, weight: 700, color: C.text, stagger: .012, dur: .25, from: { dy: 20 } });
+  });
+  kin([['LLM이 독점하던 ', C.text], ["'판단'", C.jev], ['을 ', C.text], ['별도 모델 계층', C.jev], ['으로', C.text]], W / 2, 820,
+      { t, t0: 12.85, size: 54, weight: 900, stagger: .02, dur: .3, from: { dy: 40 } });
+  kin('입력 분류·라우팅·점수화는 디시전 모델에, 분석·계획·추론은 고성능 LLM에', W / 2, 900,
+      { t, t0: 13.1, size: 30, weight: 500, color: C.dim, stagger: .006, dur: .2 });
+  ctx.restore();
+}
+
+// S5 (14.0 – 16.4) Two paths
+impact(14.1, 1);
+function s5(t) {
+  const a = env(t, 14.0, 16.45, .15, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  kin([['경쟁은 ', C.text], ['두 갈래', C.jev]], W / 2, 210, { t, t0: 14.05, size: 96, weight: 900, stagger: .05, dur: .25, from: { scale: 2.5 } });
+  // slicing line
+  const lu = expo(P(t, 14.3, 14.7));
+  ctx.save(); ctx.fillStyle = C.jev; ctx.shadowBlur = 30; ctx.shadowColor = C.jev;
+  ctx.fillRect(W / 2 - 2, 300, 4, 620 * lu); ctx.restore();
+  const L = W / 2 - 430, R = W / 2 + 430;
+  kin('NEW MODEL', L, 400, { t, t0: 14.4, size: 40, weight: 700, fam: MONO, color: C.jev, stagger: .02, dur: .25, scramble: .25 });
+  kin('새 디시전', L, 540, { t, t0: 14.5, size: 108, weight: 900, stagger: .04, dur: .35, from: { dx: -260, skew: .5 }, trail: 1 });
+  kin('모델 개발', L, 670, { t, t0: 14.6, size: 108, weight: 900, stagger: .04, dur: .35, from: { dx: -260, skew: .5 }, trail: 1 });
+  kin('Jev · d1 · Mapika Decider', L, 790, { t, t0: 14.95, size: 32, weight: 500, fam: MONO, color: C.dim, stagger: .01, dur: .2, scramble: .2 });
+  kin('LLM + DECISION HEAD', R, 400, { t, t0: 14.55, size: 40, weight: 700, fam: MONO, color: C.jev2, stagger: .02, dur: .25, scramble: .25 });
+  kin('기존 모델에', R, 540, { t, t0: 14.65, size: 108, weight: 900, stagger: .04, dur: .35, from: { dx: 260, skew: -.5 }, trail: 1 });
+  kin([['판단 헤드', C.jev2], [' 결합', C.text]], R, 670, { t, t0: 14.75, size: 108, weight: 900, stagger: .04, dur: .35, from: { dx: 260, skew: -.5 }, trail: 1 });
+  kin('Strands Decider · Clef · Laya · AutoTrust', R, 790, { t, t0: 15.1, size: 30, weight: 500, fam: MONO, color: C.dim, stagger: .008, dur: .2, scramble: .2 });
+  kin('방향은 같다 — 토큰 소비를 없애고, 판단 속도를 높인다', W / 2, 990, { t, t0: 15.4, size: 38, weight: 700, color: C.text, stagger: .012, dur: .25, from: { dy: 30 } });
+  ctx.restore();
+}
+
+// S6 (16.4 – 24.4) Timeline rush
+const TL = [
+  { d: '09.21', n: 'Laya', c: 'ConvAI Innovations', chips: ['421M · ModernBERT', '~30ms 지연', 'Apache 2.0'] },
+  { d: '09.24', n: 'GLiNER2.5-Decide', c: 'Fastino', chips: ['340M 경량', '로컬 실행', '오픈웨이트'] },
+  { d: '09.27', n: 'AutoTrust Jev-27B', c: 'AutoTrust', chips: ['Qwen3.8-27B + 109M', '벤치 84.07% vs Jev 83.85%'] },
+  { d: '09.29', n: 'd1', c: 'Liquid AI', chips: ['상용 API · d1:free', '정확도 0.742 vs Jev 0.727'] },
+  { d: '09.29', n: 'Decisions API', c: 'OpenAI · DevDay', chips: ['GPT-6 Luna', '이미지 컨텍스트', '제한적 프리뷰'] },
+  { d: '09.30', n: 'GliDE', c: 'Fastino', chips: ['Thinking Decision Model', '불확실하면 추가 추론'] },
+  { d: '10.01', n: 'Strands Decider 2B', c: 'AWS', chips: ['1.9B', 'RTX 3090 115ms', '가중치·데이터 전부 공개'] },
+  { d: '10.01', n: 'Clef 27B · flash 9B', c: 'Cloudflare', chips: ['Jev API 100% 호환', '요청당 질문 64개'] },
+  { d: 'R&D', n: 'CLM-8B', c: 'NVIDIA × Stanford', chips: ['일부 워크로드 9× 빠름', '도구 호출 정확도는 열세'] }
+];
+const T6 = 16.4, DT = .88;
+TL.forEach((_, k) => impact(T6 + k * DT + .08, .45));
+function s6(t) {
+  const a = env(t, 16.35, 24.45, .15, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  const k = clamp(Math.floor((t - T6) / DT), 0, TL.length - 1), s0 = T6 + k * DT, sEnd = k === TL.length - 1 ? 24.2 : s0 + DT, it = TL[k];
+  kin([['2주간의 ', C.text], ['추격전', C.jev]], 150, 175, { t, t0: 16.4, size: 54, weight: 900, align: 'left', stagger: .03, dur: .3, from: { dy: -40 } });
+  text(`${String(k + 1).padStart(2, '0')} / ${String(TL.length).padStart(2, '0')}`, W - 150, 175, { size: 40, weight: 700, fam: MONO, color: C.jev, align: 'right' });
+  const out = { t0: sEnd - .14, dur: .14 };
+  // date odometer
+  kin(it.d, 150, 640, { t, t0: s0, size: 190, weight: 700, fam: MONO, align: 'left', stagger: .025, dur: .25, from: { dy: -140 }, gradient: [C.jev, C.jev2],
+       out: { ...out, dy: 140, stagger: .01 } });
+  // brand
+  const nx = 860;
+  kin(it.c, nx, 430, { t, t0: s0 + .03, size: 36, weight: 700, fam: MONO, color: C.dim, align: 'left', stagger: .01, dur: .2, scramble: .25, out: { ...out, dy: -30 } });
+  kin(it.n, nx, 580, { t, t0: s0 + .05, size: 128, weight: 900, align: 'left', stagger: .018, dur: .32, maxW: W - 120 - nx,
+       from: { dx: 200, skew: -.45 }, trail: 1, color: C.text, out: { ...out, dx: -160, skew: .4, stagger: .004 } });
+  let cx = nx;
+  it.chips.forEach((c, j) => {
+    const u = eback(P(t, s0 + .2 + j * .06, s0 + .42 + j * .06)), o = 1 - P(t, out.t0, out.t0 + out.dur);
+    if (u <= 0) return;
+    ctx.save(); ctx.globalAlpha *= clamp(u) * o; ctx.translate(0, 30 * (1 - u));
+    cx += pill(c, cx, 640, { size: 30, color: j === it.chips.length - 1 && /vs|호환|열세|빠름/.test(c) ? C.warn : C.jev }) + 18;
+    ctx.restore();
+  });
+  // timeline bar
+  const x0 = 150, x1 = W - 150, ty = 900;
+  ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.10)'; ctx.fillRect(x0, ty - 2, x1 - x0, 4);
+  const prog = clamp((t - T6) / (DT * (TL.length - 1)));
+  ctx.fillStyle = grad(x0, 0, x1, 0); ctx.shadowBlur = 20; ctx.shadowColor = C.jev; ctx.fillRect(x0, ty - 2, (x1 - x0) * prog, 4); ctx.restore();
+  TL.forEach((e, j) => {
+    const x = lerp(x0, x1, j / (TL.length - 1)), on = j <= k, cur = j === k;
+    ctx.save(); ctx.beginPath(); ctx.arc(x, ty, cur ? 13 : 8, 0, Math.PI * 2);
+    ctx.fillStyle = on ? C.jev : '#1B2436'; if (cur) { ctx.shadowBlur = 30; ctx.shadowColor = C.jev; } ctx.fill(); ctx.restore();
+    text(e.d, x, ty + 50, { size: 20, weight: 700, fam: MONO, color: cur ? C.jev : C.dim2, align: 'center' });
+  });
+  text('※ 각 사 발표 수치 (바이라인네트워크 보도 기준)', W - 150, 1010, { size: 22, weight: 400, color: C.dim, align: 'right' });
+  ctx.restore();
+}
+
+// S7 (24.4 – 27.4) Typographic wall + category statement
+const WALL = ['Jev', 'Laya', 'GLiNER2.5-Decide', 'AutoTrust Jev-27B', 'd1', 'Decisions API', 'GliDE', 'Strands Decider 2B', 'Clef 27B', 'Clef-flash 9B',
+  'CLM-8B', 'Mapika Decider', 'THIS/THAT', 'Kev', 'imajev', 'Plumb-4B', 'Bosun v3.1'];
+impact(24.95, 1.1);
+function s7(t) {
+  const a = env(t, 24.35, 27.45, .2, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  for (let r = 0; r < 8; r++) {
+    const names = WALL.slice(r * 2 % WALL.length).concat(WALL).join('   ·   ') + '   ·   ';
+    const y = 140 + r * 128, sz = r % 2 ? 84 : 104;
+    const ru = expo(P(t, 24.4 + r * .03, 24.9 + r * .03));
+    ctx.save(); ctx.translate((1 - ru) * (r % 2 ? 600 : -600), 0);
+    marquee(names, y, { t, size: sz, weight: 900, fam: r % 3 === 0 ? MONO : KR, speed: (r % 2 ? -1 : 1) * (160 + r * 30),
+                        alpha: r % 3 === 1 ? .16 : .10, stroke: r % 2 ? 0 : 2, color: r % 4 === 0 ? C.jev : C.text });
+    ctx.restore();
+  }
+  // center band
+  const bu = expo(P(t, 24.75, 25.1));
+  ctx.save(); ctx.fillStyle = 'rgba(7,10,18,0.9)'; ctx.fillRect(0, 540 - 170 * bu, W, 340 * bu);
+  ctx.fillStyle = grad(0, 0, W, 0); ctx.globalAlpha *= bu;
+  ctx.fillRect(0, 540 - 170 * bu, W, 3); ctx.fillRect(0, 540 + 170 * bu - 3, W, 3); ctx.restore();
+  kin([['Jev', C.jev], [' 하나가 연', C.text]], W / 2, 465, { t, t0: 24.9, size: 60, weight: 700, stagger: .03, dur: .3, from: { dy: -40 } });
+  kin([['새로운 AI 모델 카테고리', C.text]], W / 2, 595, { t, t0: 25.15, size: 116, weight: 900, stagger: .035, dur: .3, from: { scale: 2.2 }, glow: 30, glowColor: hexA(C.jev, .4) });
+  kin('DECISION MODEL', W / 2, 675, { t, t0: 25.8, size: 34, weight: 700, fam: MONO, color: C.jev, stagger: .03, dur: .3, scramble: .3,
+       spacing: lerp(4, 22, eo(P(t, 25.8, 27.2))) });
+  ctx.restore();
+}
+
+// S8 (27.4 – 30) End card
+impact(27.55, .8);
+function s8(t) {
+  const a = env(t, 27.35, 31, .2, .1);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  kin([['판단은 ', C.text], ['디시전 모델', C.jev], [',', C.text]], W / 2, 440, { t, t0: 27.45, size: 112, weight: 900, stagger: .04, dur: .35, from: { dy: 90, rot: .15 }, trail: 1 });
+  kin([['추론은 ', C.text], ['LLM', C.llm], ['.', C.text]], W / 2, 590, { t, t0: 27.8, size: 112, weight: 900, stagger: .04, dur: .35, from: { dy: 90, rot: .15 }, trail: 1 });
+  const lw = expo(P(t, 28.3, 28.8));
+  ctx.save(); ctx.fillStyle = grad(W / 2 - 320, 0, W / 2 + 320, 0); ctx.fillRect(W / 2 - 320 * lw, 665, 640 * lw, 3); ctx.restore();
+  kin('디시전 AI 전쟁은 이제 시작', W / 2, 760, { t, t0: 28.5, size: 48, weight: 700, color: C.text, stagger: .025, dur: .3, from: { dy: 30 } });
+  kin('DECISION AI WAR · 2026', W / 2, 840, { t, t0: 28.8, size: 30, weight: 700, fam: MONO, color: C.jev, stagger: .015, dur: .25, scramble: .3, spacing: 6 });
+  text('출처: 바이라인네트워크, 김우용 기자 「오픈AI・AWS도 참전, Jev가 터뜨린 ‘디시전 AI’ 전쟁」 (2026.10.02) · 수치는 각 사 발표 기준', W / 2, 1010,
+       { size: 22, weight: 400, color: C.dim, align: 'center', alpha: eo(P(t, 29.0, 29.4)) });
+  ctx.restore();
+}
+
+
+  return {
+    draw(t, scene) { const [cx, cy] = camera(t); ctx.save(); ctx.translate(cx, cy); s1(t); s2(t); s3a(t); s3b(t); s4(t); s5(t); s6(t); s7(t); s8(t); ctx.restore(); flash(t); },
+    warm: t => env(t, 6.0, 7.2, .3, .5) * .6
+  };
+})();
+
+// ================= MODULE J =================
+const MOD_J = (() => {
+// ---------- camera impacts (shake + flash) ----------
+const IMPACTS = [];
+const impact = (t, s = 1, color = C.jev) => IMPACTS.push({ t, s, color });
+function camera(t) {
+  let x = 0, y = 0;
+  for (const im of IMPACTS) {
+    const d = t - im.t; if (d < 0 || d > .45) continue;
+    const amp = 22 * im.s * Math.exp(-d * 11);
+    x += Math.sin(d * 95 + im.t * 7) * amp; y += Math.cos(d * 83 + im.t * 3) * amp * .7;
+  }
+  return [x, y];
+}
+function flash(t) {
+  for (const im of IMPACTS) {
+    const d = t - im.t; if (d < 0 || d > .3) continue;
+    ctx.save(); ctx.globalAlpha = .16 * im.s * Math.exp(-d * 14);
+    ctx.fillStyle = im.color; ctx.fillRect(0, 0, W, H); ctx.restore();
+  }
+}
+
+
+
+
+// extra helpers for the mechanism diagram (same as the 15s piece)
+function bez(p0, p1, p2, p3, u) {
+  const m = 1 - u;
+  return [m*m*m*p0[0] + 3*m*m*u*p1[0] + 3*m*u*u*p2[0] + u*u*u*p3[0],
+          m*m*m*p0[1] + 3*m*m*u*p1[1] + 3*m*u*u*p2[1] + u*u*u*p3[1]];
+}
+function curve(a, b, alpha, color, draw = 1) {
+  const c1 = [lerp(a[0], b[0], .5), a[1]], c2 = [lerp(a[0], b[0], .5), b[1]];
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.strokeStyle = color; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  const N = 40;
+  for (let i = 0; i <= N * draw; i++) { const p = bez(a, c1, c2, b, i / N); i ? ctx.lineTo(...p) : ctx.moveTo(...p); }
+  ctx.stroke(); ctx.restore();
+  return u => bez(a, c1, c2, b, u);
+}
+function dot(x, y, r, color, alpha = 1) {
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.fillStyle = color; ctx.shadowBlur = 18; ctx.shadowColor = color;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+}
+function strike(x, y, w, u, color = C.llm, h = 10) {
+  if (u <= 0) return;
+  ctx.save(); ctx.fillStyle = color; ctx.shadowBlur = 16; ctx.shadowColor = color;
+  ctx.fillRect(x, y, w * expo(u), h); ctx.restore();
+}
+
+// S1 (0 – 4.5) LLM speaks token by token
+const TOKENS = [
+  ['이', 0], [' 티켓은', 0], [' 아마도', 1], [' 결제', 0], [' 문의', 0], ['일', 0], [' 것', 0], [' 같습니다.', 0],
+  [' 다만', 0], [' 배송', 0], [' 지연', 0], ['일', 0], [' 수도', 1], [' 있고,', 1], [' 혹시', 1], [' 환불', 0],
+  [' 요청', 0], ['이라면', 1], [' …', 0]
+];
+impact(.32, 1, C.llm);
+[0, 1, 2, 3].forEach(i => impact(3.0 + i * .2, .4, C.llm));
+function s1(t) {
+  const a = env(t, 0, 4.5, .2, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  if (t > 4.2) ctx.translate((rnd(Math.floor(t * 30)) - .5) * 60, 0); // glitch-out
+  pill('기존 LLM', 140, 110, { color: C.llm, alpha: eo(P(t, 0, .3)) });
+  kin([['LLM은 ', C.text], ['말합니다.', C.llm]], 140, 270, { t, t0: .1, size: 104, weight: 900, align: 'left', stagger: .045, dur: .3, from: { scale: 2.4 } });
+
+  const bx = 140, by = 340, bw = 1640, bh = 300;
+  card(bx, by, bw, bh, { alpha: eo(P(t, .45, .8)) });
+  kin('PROMPT  ›  "이 고객 티켓을 분류해줘"', bx + 44, by + 64, { t, t0: .55, size: 26, weight: 500, fam: MONO, color: C.dim, align: 'left', stagger: .008, dur: .2, scramble: .2 });
+  const T0 = .8, step = .12;
+  const n = clamp(Math.floor((t - T0) / step) + 1, 0, TOKENS.length);
+  let x = bx + 44, y = by + 150; const maxX = bx + bw - 60, size = 50;
+  for (let i = 0; i < n; i++) {
+    let [s, hl] = TOKENS[i];
+    let w = measure(s, size);
+    if (x + w > maxX) { x = bx + 44; y += 76; s = s.trimStart(); w = measure(s, size); }
+    const age = P(t, T0 + i * step, T0 + i * step + .18);
+    if (age < 1) {
+      ctx.save(); ctx.globalAlpha *= (1 - age) * .5; ctx.fillStyle = hexA(C.llm, .35);
+      rrect(x - 4, y - size * .9, w + 8, size * 1.2, 8); ctx.fill(); ctx.restore();
+    }
+    ctx.save(); const sc = lerp(1.35, 1, expo(age)); ctx.translate(x, y); ctx.scale(sc, sc);
+    text(s, 0, 0, { size, weight: 700, color: hl ? C.warn : C.text, alpha: .4 + .6 * age }); ctx.restore();
+    x += w;
+  }
+  if (Math.floor(t * 4) % 2 === 0 || n < TOKENS.length) {
+    ctx.save(); ctx.fillStyle = C.llm; ctx.globalAlpha *= eo(P(t, .7, .8)); ctx.fillRect(x + 8, y - 42, 22, 52); ctx.restore();
+  }
+  const ma = eo(P(t, .7, 1.0));
+  const secs = Math.max(0, (t - T0) * 2.1).toFixed(1);
+  text(`⏱ 응답 대기 ${secs}s`, 140, 730, { size: 34, weight: 700, color: C.llm, alpha: ma });
+  text(`출력 토큰 ${n}개 · 순차 생성 · 토큰당 과금`, 520, 730, { size: 30, weight: 500, color: C.dim, alpha: ma });
+  const warns = ['자유형 텍스트 → 파싱 필요', '애매한 답 · 환각 가능성', '느린 순차 생성', '출력 토큰 과금'];
+  let wx = 140;
+  warns.forEach((w, i) => {
+    const u = P(t, 3.0 + i * .2, 3.3 + i * .2);
+    if (u <= 0) { wx += measure('⚠ ' + w, 30) + 44 + 18; return; }
+    const sc = lerp(1.8, 1, expo(u)), ww = measure('⚠ ' + w, 30) + 44;
+    ctx.save(); ctx.translate(wx + ww / 2, 830); ctx.scale(sc, sc); ctx.translate(-(wx + ww / 2), -830);
+    pill('⚠ ' + w, wx, 803, { color: C.llm, size: 30, alpha: clamp(u * 3) }); ctx.restore();
+    wx += ww + 18;
+  });
+  ctx.restore();
+}
+
+// S2 (4.5 – 7.5) "자동화에 필요한 건 문장이 아니라 결정"
+impact(6.0, 1.4);
+function s2(t) {
+  const a = env(t, 4.45, 7.55, .15, .25);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  const out = { t0: 7.15, dur: .3, scale: 2.6, stagger: .01 };
+  kin('그런데 자동화에 필요한 건', W / 2, 300, { t, t0: 4.55, size: 64, weight: 700, stagger: .025, dur: .35, from: { dy: 50 }, out: { ...out, scale: 1, dy: -80 } });
+  const r = kin('긴 문장이 아니라', W / 2, 470, { t, t0: 4.95, size: 112, weight: 900, color: C.dim, stagger: .035, dur: .3, from: { dx: -120, skew: .4 }, trail: 1, out: { ...out, scale: 1, dy: -80 } });
+  if (t < 7.2) strike(r.x0 - 20, 430, r.w + 40, P(t, 5.55, 5.8));
+  for (let k = 1; k <= 3; k++) {
+    const u = P(t, 6.0 + k * .06, 6.9 + k * .06);
+    if (u > 0 && u < 1) kin('결정', W / 2, 830, { t: 99, size: 320 * (1 + eo(u) * .1 * k), stroke: 2, color: C.jev, alpha: (1 - u) * .5 });
+  }
+  kin('결정', W / 2, 830, { t, t0: 5.85, size: 320, weight: 900, stagger: .1, dur: .3, from: { scale: 3.4 }, gradient: [C.jev, C.jev2], glow: 60, glowColor: hexA(C.jev, .55), out });
+  kin('DECISION', W / 2, 935, { t, t0: 6.35, size: 34, weight: 700, fam: MONO, color: C.jev, stagger: .03, dur: .25, scramble: .3, spacing: lerp(6, 30, eo(P(t, 6.35, 7.2))), out: { ...out, scale: 1 } });
+  ctx.restore();
+}
+
+// S3 (7.5 – 10.0) Title
+impact(7.95, 1.2);
+function s3(t) {
+  const a = env(t, 7.45, 10.05, .15, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  const cx = W / 2;
+  for (let i = 0; i < 3; i++) {
+    const u = ((t - 7.9) * .7 + i / 3) % 1;
+    if (t < 7.9) break;
+    ctx.save(); ctx.globalAlpha *= (1 - u) * .35; ctx.strokeStyle = C.jev; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, 540, 160 + u * 420, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+  }
+  const out = { t0: 9.7, dur: .3, dy: -100, stagger: .01 };
+  kin('TypeSafe AI', cx, 330, { t, t0: 7.55, size: 38, weight: 500, fam: MONO, color: C.dim, stagger: .02, dur: .25, scramble: .3, out });
+  kin('Jev', cx, 600, { t, t0: 7.75, size: 290, weight: 900, stagger: .08, dur: .3, from: { scale: 3, dy: -60 }, gradient: [C.jev, C.jev2], glow: 60, glowColor: hexA(C.jev, .6), out });
+  kin('SYSTEM ONE MODEL', cx, 690, { t, t0: 8.15, size: 38, weight: 700, fam: MONO, color: C.jev, stagger: .02, dur: .25, scramble: .3, spacing: lerp(2, 10, eo(P(t, 8.15, 9.6))), out });
+  kin([['텍스트를 생성하지 않고, ', C.text], ['결정', C.jev, 900], ['합니다.', C.text]], cx, 820,
+      { t, t0: 8.55, size: 62, weight: 700, stagger: .02, dur: .3, from: { dy: 50, rot: .15 }, out });
+  ctx.restore();
+}
+
+// S4 (10.0 – 15.5) Mechanism — the 15s diagram, shifted +4.4s and extended
+function bars(x, y, w, items, u, chosenIdx) {
+  items.forEach(([label, p], i) => {
+    const yy = y + i * 34, best = i === chosenIdx;
+    text(label, x, yy + 20, { size: 22, weight: 500, fam: MONO, color: best ? C.text : C.dim });
+    const bx = x + 130, bw = w - 220;
+    ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.06)'; rrect(bx, yy + 6, bw, 16, 8); ctx.fill();
+    ctx.fillStyle = best ? grad(bx, 0, bx + bw, 0) : C.dim2; rrect(bx, yy + 6, Math.max(16, bw * p * u), 16, 8); ctx.fill(); ctx.restore();
+    text((p * u).toFixed(2), x + w - 10, yy + 21, { size: 22, weight: 700, fam: MONO, color: best ? C.jev : C.dim, align: 'right' });
+  });
+}
+impact(11.85, .9);
+function s4(t) {
+  const T = t - 4.4;
+  const a = env(T, 5.6, 11.1, .3, .35);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  kin([['State in', C.text], ['  →  ', C.jev], ['Typed decisions out', C.text]], W / 2, 140,
+      { t: T, t0: 5.6, size: 48, weight: 700, fam: MONO, stagger: .015, dur: .25, scramble: .3 });
+  const iu = expo(P(T, 5.7, 6.2));
+  ctx.save(); ctx.translate(-120 * (1 - iu), 0);
+  const ix = 100, iy = 210, iw = 580, ih = 420;
+  card(ix, iy, iw, ih, { alpha: iu });
+  text('INPUT · 비정형 상태', ix + 32, iy + 52, { size: 26, weight: 700, color: C.dim, alpha: iu });
+  const lines = [
+    ['{', C.dim], ['  "from": "kim@acme.co",', C.text], ['  "subject":', C.text], ['    "결제가 두 번 됐어요",', C.warn],
+    ['  "body": "카드에서 2번', C.text], ['    빠져나갔어요. 빨리', C.text], ['    확인 부탁드려요!"', C.text], ['}', C.dim]
+  ];
+  lines.forEach(([l, col], i) => kin(l, ix + 32, iy + 108 + i * 40, { t: T, t0: 5.85 + i * .06, size: 25, weight: 500, fam: MONO, color: col, align: 'left', stagger: .004, dur: .12, scramble: .12, alpha: iu }));
+  ctx.restore();
+  const su = expo(P(T, 6.0, 6.5));
+  ctx.save(); ctx.translate(-120 * (1 - su), 0);
+  const sx = 100, sy = 660, sw = 580, sh = 250;
+  card(sx, sy, sw, sh, { alpha: su, stroke: hexA(C.jev, .35) });
+  text('SCHEMA · 타입 질문', sx + 32, sy + 52, { size: 26, weight: 700, color: C.jev, alpha: su });
+  [['route', 'enum{billing|shipping|tech}'], ['urgent', 'bool'], ['sentiment', 'score(1–5)']].forEach(([k, v], i) =>
+    kin([[k, C.text], [': ', C.dim], [v, C.jev2]], sx + 32, sy + 110 + i * 46, { t: T, t0: 6.15 + i * .08, size: 25, weight: 500, fam: MONO, align: 'left', stagger: .006, dur: .15, scramble: .15, alpha: su }));
+  ctx.restore();
+
+  const nx = 960, ny = 520, nr = 105;
+  const nu = eback(P(T, 6.3, 6.9));
+  const pulse = 1 + .06 * Math.sin(T * 9) * P(T, 6.9, 7.3) * (1 - P(T, 7.3, 7.5));
+  const lin = P(T, 6.4, 7.0);
+  const cIn1 = curve([ix + iw, 420], [nx - nr, ny - 20], lin * .8, hexA(C.jev, .5), lin);
+  const cIn2 = curve([sx + sw, 785], [nx - nr, ny + 20], lin * .8, hexA(C.jev, .5), lin);
+  const ox = 1260, ow = 560, oh = 205, oys = [210, 440, 670];
+  const lout = P(T, 7.35, 7.6);
+  const outs = oys.map(oy => curve([nx + nr, ny], [ox, oy + oh / 2], lout * .8, hexA(C.jev, .5), lout));
+  if (T > 6.8 && T < 7.6) for (let k = 0; k < 6; k++) {
+    const u = ((T - 6.8) * 1.6 + k / 6) % 1, p1 = cIn1(u), p2 = cIn2(u);
+    dot(p1[0], p1[1], 5, C.jev, 1 - P(T, 7.4, 7.6)); dot(p2[0], p2[1], 5, C.jev2, 1 - P(T, 7.4, 7.6));
+  }
+  const bu = P(T, 7.35, 7.75);
+  if (bu > 0 && bu < 1) outs.forEach(f => { const p = f(eo(bu)); dot(p[0], p[1], 8, C.jev); });
+  ctx.save(); ctx.translate(nx, ny); ctx.scale(nu * pulse, nu * pulse); ctx.globalAlpha *= clamp(nu);
+  ctx.shadowBlur = 70; ctx.shadowColor = hexA(C.jev, .7);
+  ctx.beginPath(); ctx.arc(0, 0, nr, 0, Math.PI * 2); ctx.fillStyle = grad(-nr, -nr, nr, nr); ctx.fill();
+  ctx.shadowBlur = 0; ctx.beginPath(); ctx.arc(0, 0, nr - 10, 0, Math.PI * 2); ctx.fillStyle = '#081018'; ctx.fill();
+  setFont(64, 900); ctx.textAlign = 'center'; ctx.fillStyle = grad(-60, -40, 60, 20); ctx.fillText('Jev', 0, 22);
+  ctx.restore();
+  kin('1-pass · 병렬 추론', nx, ny + nr + 54, { t: T, t0: 6.7, size: 28, weight: 700, stagger: .02, dur: .25, from: { dy: 20 } });
+  const lu = eback(P(T, 7.4, 7.8));
+  if (lu > 0) { ctx.save(); ctx.translate(nx, ny - nr - 60); ctx.scale(lu, lu); pill('⚡ ≈ 0.1s', 0, -24, { size: 30, color: C.jev, fam: MONO, align: 'center' }); ctx.restore(); }
+
+  const ou = expo(P(T, 7.45, 7.85)), fill = eo(P(T, 7.6, 8.4));
+  const outDefs = [
+    { k: 'route', type: 'enum', val: 'billing', p: .96, kind: 'bar', items: [['billing', .96], ['shipping', .03], ['tech', .01]], ci: 0, safe: '✓ 정의된 3개 값 중 하나만' },
+    { k: 'urgent', type: 'bool', val: 'true', p: .91, kind: 'bar', items: [['true', .91], ['false', .09]], ci: 0, safe: '✓ true / false 외 불가' },
+    { k: 'sentiment', type: 'score', val: '2 / 5', p: .84, kind: 'col', items: [.06, .84, .07, .02, .01], ci: 1, safe: '✓ 1–5 정수만' }
+  ];
+  outDefs.forEach((d, i) => {
+    const oy = oys[i];
+    const hl = P(T, 9.1 + i * .25, 9.35 + i * .25) * (1 - P(T, 9.6 + i * .25, 9.9 + i * .25));
+    ctx.save(); ctx.translate(140 * (1 - ou), 0);
+    card(ox, oy, ow, oh, { alpha: ou, stroke: hexA(C.jev, .45 + .5 * hl), glow: (30 + 40 * hl) * ou, glowColor: hexA(C.jev, .25 + .3 * hl) });
+    ctx.globalAlpha *= ou;
+    kin([[d.k, C.text], ['  ' + d.type, C.dim, 500]], ox + 30, oy + 48, { t: T, t0: 7.5, size: 26, weight: 700, fam: MONO, align: 'left', stagger: .01, dur: .15, scramble: .2 });
+    kin(d.val, ox + ow - 30, oy + 52, { t: T, t0: 7.55, size: 38, weight: 700, fam: MONO, color: C.jev, align: 'right', stagger: .02, dur: .2, scramble: .3, from: { scale: 1.6 } });
+    if (d.kind === 'bar') bars(ox + 30, oy + 78, ow - 30, d.items, fill, d.ci);
+    else {
+      d.items.forEach((p, j) => {
+        const cw = 56, gap = 20, bx = ox + 40 + j * (cw + gap), base = oy + oh - 24, hmax = 90;
+        ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.06)'; rrect(bx, base - hmax, cw, hmax, 8); ctx.fill();
+        const hh = Math.max(8, hmax * p * fill);
+        ctx.fillStyle = j === d.ci ? grad(0, base - hmax, 0, base, C.jev, C.jev2) : C.dim2; rrect(bx, base - hh, cw, hh, 8); ctx.fill(); ctx.restore();
+        text(String(j + 1), bx + cw / 2, base - hmax - 6, { size: 20, weight: 700, fam: MONO, color: j === d.ci ? C.jev : C.dim, align: 'center' });
+      });
+      text('p=' + (d.p * fill).toFixed(2), ox + ow - 30, oy + oh - 30, { size: 24, weight: 700, fam: MONO, color: C.jev, align: 'right' });
+    }
+    ctx.restore();
+    // type-safety tag pops beside each card
+    const tu = P(T, 9.1 + i * .25, 9.4 + i * .25);
+    if (tu > 0) { ctx.save(); ctx.globalAlpha *= clamp(tu * 3) * a; pill(d.safe, ox + ow / 2, oy - 18, { size: 20, color: C.jev, align: 'center' }); ctx.restore(); }
+  });
+  kin([['3개 결정 · ', C.jev], ['동시 출력', C.jev, 900]], ox + ow / 2, 920, { t: T, t0: 7.9, size: 30, weight: 700, stagger: .03, dur: .25, from: { scale: 1.8 } });
+  kin([['비정형 상태 → ', C.text], ['타입이 보장된 값', C.jev], [' + ', C.text], ['보정된 확률', C.jev], ['을 한 번에', C.text]],
+      W / 2, 1015, { t: T, t0: 8.2, size: 40, weight: 700, stagger: .015, dur: .25, from: { dy: 30 } });
+  ctx.restore();
+}
+
+// S5 (15.5 – 21.0) Five differentiators — big-type slams
+const DIFF = [
+  { big: '1 PASS', label: '병렬로 한 번에 결정', sub: '토큰을 하나씩 생성하지 않고, 모든 선택지의 확률을 동시에 출력' },
+  { big: '70–500ms', label: '40–200× 빠른 응답', sub: '프런티어 LLM 응답 3–329s 대비 · 실시간 서브초 처리' },
+  { big: '$0', label: '출력 토큰 무료', sub: 'LLM 출력 단가는 보통 입력의 ~5배 · 워크플로 평가 444× 저렴' },
+  { big: '0%', label: '환각 · 타입 오류', sub: '유효한 출력은 스키마로 미리 정의 — 그 밖의 값은 나올 수 없음' },
+  { big: 'p=0.96', label: '모든 답에 보정된 확률', sub: '신뢰도로 자동 처리와 사람 검토를 나눌 수 있음' }
+];
+const T5 = 15.5, D5 = 1.1;
+DIFF.forEach((_, k) => impact(T5 + k * D5 + .05, 1));
+function s5(t) {
+  if (t < T5 - .05 || t > 21.1) return;
+  const k = clamp(Math.floor((t - T5) / D5), 0, DIFF.length - 1), t0 = T5 + k * D5, t1 = t0 + D5, d = DIFF[k];
+  const outU = k === DIFF.length - 1 ? ein(P(t, 20.75, 21.0)) : ein(P(t, t1 - .14, t1));
+  ctx.save(); ctx.globalAlpha *= 1 - outU; ctx.translate(0, -outU * 140);
+  kin([['왜 ', C.text], ['다른가', C.jev]], 140, 175, { t, t0: T5, size: 52, weight: 900, align: 'left', stagger: .03, dur: .3, from: { dy: -40 } });
+  // ghost outline of the big word scrolling behind
+  marquee(`${d.big}   ${d.big}   ${d.big}   `, 380, { t, size: 200, fam: MONO, weight: 700, speed: 260 * (k % 2 ? -1 : 1), alpha: .06, stroke: 2, color: C.jev });
+  for (let j = 3; j >= 1; j--) {
+    const u = P(t, t0, t0 + .35);
+    if (u < 1) kin(d.big, W / 2, 610, { t: 99, size: 280 * (1 + j * .1 * (1 - u)), weight: 700, fam: MONO, color: C.jev, alpha: .12 * (1 - u) });
+  }
+  kin(d.big, W / 2, 610, { t, t0, size: 280, weight: 700, fam: MONO, stagger: .03, dur: .28, from: { scale: 2.6 }, scramble: .22, gradient: [C.jev, C.jev2], glow: 60, glowColor: hexA(C.jev, .5), maxW: 1600 });
+  kin(d.label, W / 2, 770, { t, t0: t0 + .12, size: 74, weight: 900, stagger: .025, dur: .3, from: { dy: 60, skew: -.3 }, trail: 1 });
+  kin(d.sub, W / 2, 850, { t, t0: t0 + .25, size: 30, weight: 500, color: C.dim, stagger: .006, dur: .2, from: { dy: 15 } });
+  text(`0${k + 1} / 05`, 140, 1000, { size: 30, weight: 700, fam: MONO, color: C.jev });
+  text('※ TypeSafe AI 발표 기준', W - 140, 1000, { size: 24, weight: 400, color: C.dim, align: 'right' });
+  ctx.restore();
+}
+
+// S6 (21.0 – 23.6) Duel: LLM vs Jev
+const DUEL = [['문장 생성', '타입 값 결정'], ['순차 · 토큰 단위', '병렬 · 1-pass'], ['수 초 ~ 수십 초', '70–500ms'], ['과신 · 불일치', '보정된 확률']];
+impact(21.15, 1.1);
+DUEL.forEach((_, i) => impact(21.55 + i * .3, .45));
+function s6(t) {
+  const a = env(t, 21.0, 23.65, .15, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  kin('LLM', W / 2 - 110, 250, { t, t0: 21.05, size: 120, weight: 900, color: C.llm, align: 'right', stagger: .04, dur: .3, from: { dx: -300, skew: .5 }, trail: 1 });
+  kin('Jev', W / 2 + 110, 250, { t, t0: 21.05, size: 120, weight: 900, align: 'left', gradient: [C.jev, C.jev2], stagger: .04, dur: .3, from: { dx: 300, skew: -.5 }, trail: 1 });
+  kin('VS', W / 2, 240, { t, t0: 21.15, size: 54, weight: 700, fam: MONO, color: C.dim, stagger: .05, dur: .25, from: { scale: 3, rot: .6 } });
+  ctx.save(); ctx.fillStyle = hexA(C.jev, .5); ctx.fillRect(W / 2 - 1, 330, 2, 560 * expo(P(t, 21.3, 21.7))); ctx.restore();
+  DUEL.forEach(([l, j], i) => {
+    const y = 420 + i * 130, t0 = 21.5 + i * .3;
+    const rl = kin(l, W / 2 - 80, y, { t, t0, size: 56, weight: 700, color: '#B9A8A6', align: 'right', stagger: .015, dur: .25, from: { dx: -200 } });
+    strike(rl.x0 - 10, y - 24, rl.w + 20, P(t, t0 + .25, t0 + .45), C.llm, 6);
+    kin(j, W / 2 + 80, y, { t, t0: t0 + .05, size: 60, weight: 900, color: C.text, align: 'left', stagger: .015, dur: .25, from: { dx: 200 }, glow: 18, glowColor: hexA(C.jev, .4) });
+  });
+  ctx.restore();
+}
+
+// S7 (23.6 – 27.2) Use cases
+const USES = ['티켓·요청 라우팅', '분류 · 스코어링 · 추출', 'LLM 출력 가드레일', '실시간 워크플로 분기', '대규모 데이터 처리'];
+impact(23.7, 1);
+function s7(t) {
+  const a = env(t, 23.55, 27.25, .15, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  marquee('ROUTING · CLASSIFY · SCORE · EXTRACT · GUARDRAIL · ', 1000, { t, size: 150, fam: MONO, weight: 700, speed: 180, alpha: .06, stroke: 2, color: C.jev });
+  kin('어디에 쓰나', W / 2, 220, { t, t0: 23.6, size: 104, weight: 900, stagger: .05, dur: .3, from: { scale: 2.6 } });
+  kin([['답이 정해진 ', C.dim], ['대량 · 반복 의사결정', C.jev]], W / 2, 305, { t, t0: 23.95, size: 42, weight: 700, stagger: .018, dur: .25, from: { dy: 30 } });
+  const rows = [USES.slice(0, 3), USES.slice(3)];
+  let idx = 0;
+  rows.forEach((row, r) => {
+    const size = 40, padX = 36, gap = 28;
+    const ws = row.map(s => measure(s, size) + padX * 2);
+    let x = W / 2 - (ws.reduce((s, w) => s + w, 0) + gap * (row.length - 1)) / 2;
+    row.forEach((s, i) => {
+      const k = idx++, t0 = 24.3 + k * .14, u = P(t, t0, t0 + .45);
+      if (u > 0) {
+        const e = eback(u), ang = rnd(k * 7) * Math.PI * 2;
+        const fx = Math.cos(ang) * 900 * (1 - expo(u)), fy = Math.sin(ang) * 500 * (1 - expo(u));
+        const cx = x + ws[i] / 2, cy = 420 + r * 120 + 35;
+        ctx.save(); ctx.translate(cx + fx, cy + fy); ctx.rotate((rnd(k * 3) - .5) * 1.2 * (1 - expo(u))); ctx.scale(e, e); ctx.translate(-cx, -cy);
+        pill(s, x, 420 + r * 120, { size, padX, color: C.jev, alpha: clamp(u * 3) });
+        ctx.restore();
+      }
+      x += ws[i] + gap;
+    });
+  });
+  const rl = kin([['✕ ', C.llm], ['채팅 · 코드 생성 · 긴 설명', C.dim], ['  →  여전히 LLM의 몫', C.dim]], W / 2, 780,
+      { t, t0: 25.4, size: 38, weight: 700, stagger: .012, dur: .25, from: { dy: 30 } });
+  kin([['결정', C.jev], ['이 필요한 곳에 ', C.text], ['Jev', C.jev]], W / 2, 880, { t, t0: 25.9, size: 60, weight: 900, stagger: .03, dur: .3, from: { scale: 2 }, glow: 20, glowColor: hexA(C.jev, .4) });
+  ctx.restore();
+}
+
+// S8 (27.2 – 30) End card
+impact(27.95, 1);
+function s8(t) {
+  const a = env(t, 27.15, 31, .2, .1);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  const lw = expo(P(t, 27.25, 27.7));
+  ctx.save(); ctx.fillStyle = grad(W / 2 - 340, 0, W / 2 + 340, 0); ctx.fillRect(W / 2 - 340 * lw, 330, 680 * lw, 3); ctx.restore();
+  kin([['Unstructured state in ', C.text], ['→', C.jev], [' Typed decisions out', C.text]], W / 2, 450,
+      { t, t0: 27.3, size: 50, weight: 700, fam: MONO, stagger: .012, dur: .25, scramble: .3 });
+  kin('TypeSafe Jev', W / 2, 640, { t, t0: 27.8, size: 150, weight: 900, stagger: .04, dur: .3, from: { scale: 2.6, dy: -40 }, gradient: [C.jev, C.jev2], glow: 50, glowColor: hexA(C.jev, .5) });
+  kin([['대화·코드 생성은 ', C.dim], ['LLM', C.llm], [',  빠르고 정확한 결정은 ', C.dim], ['Jev', C.jev]], W / 2, 760,
+      { t, t0: 28.4, size: 42, weight: 700, stagger: .015, dur: .25, from: { dy: 30 } });
+  kin('SYSTEM ONE MODEL · EARLY ACCESS 2026.09', W / 2, 840, { t, t0: 28.8, size: 26, weight: 700, fam: MONO, color: C.jev, stagger: .01, dur: .2, scramble: .3, spacing: 4 });
+  text('※ 속도·비용·환각 0% 등 수치는 TypeSafe AI 공개 자료 기준 벤더 발표값', W / 2, 1010, { size: 22, weight: 400, color: C.dim, align: 'center', alpha: eo(P(t, 29.0, 29.4)) });
+  ctx.restore();
+}
+
+
+  return {
+    draw(t, scene) { const [cx, cy] = camera(t); ctx.save(); ctx.translate(cx, cy); s1(t); s2(t); s3(t); s4(t); s5(t); s6(t); s7(t); s8(t); ctx.restore(); flash(t); },
+    warm: t => env(t, 0, 4.8, .1, .5) + env(t, 21.0, 23.6, .2, .3) * .35
+  };
+})();
+
+// ================= MODULE N =================
+const MOD_N = (() => {
+// ---------- camera impacts (shake + flash) ----------
+const IMPACTS = [];
+const impact = (t, s = 1, color = C.jev) => IMPACTS.push({ t, s, color });
+function camera(t) {
+  let x = 0, y = 0;
+  for (const im of IMPACTS) {
+    const d = t - im.t; if (d < 0 || d > .45) continue;
+    const amp = 22 * im.s * Math.exp(-d * 11);
+    x += Math.sin(d * 95 + im.t * 7) * amp; y += Math.cos(d * 83 + im.t * 3) * amp * .7;
+  }
+  return [x, y];
+}
+function flash(t) {
+  for (const im of IMPACTS) {
+    const d = t - im.t; if (d < 0 || d > .3) continue;
+    ctx.save(); ctx.globalAlpha = .16 * im.s * Math.exp(-d * 14);
+    ctx.fillStyle = im.color; ctx.fillRect(0, 0, W, H); ctx.restore();
+  }
+}
+
+
+// ---- new scenes for the 3-minute cut (local time starts at 0 for each scene) ----
+function dot(x, y, r, color, alpha = 1) {
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.fillStyle = color; ctx.shadowBlur = 18; ctx.shadowColor = color;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+}
+
+function chapter(t, num, title, sub) {
+  const a = env(t, 0, 2.6, .1, .3);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  const out = { t0: 2.25, dur: .3, dx: -220, skew: .35, stagger: .004 };
+  kin(num, W / 2 + 420 - LIVE * 6 % 40, 760, { t, t0: 0, size: 640, weight: 700, fam: MONO, stroke: 2, color: C.jev, alpha: .22, stagger: .08, dur: .6, from: { dx: 500 }, out });
+  const lw = expo(P(t, .1, .5)) * (1 - ein(P(t, 2.25, 2.5)));
+  ctx.save(); ctx.fillStyle = grad(W / 2 - 300, 0, W / 2 + 300, 0); ctx.shadowBlur = 20; ctx.shadowColor = C.jev;
+  ctx.fillRect(W / 2 - 300 * lw, 470, 600 * lw, 3); ctx.restore();
+  kin(`PART ${num}`, W / 2, 430, { t, t0: .1, size: 40, weight: 700, fam: MONO, color: C.jev, stagger: .03, dur: .25, scramble: .3, spacing: lerp(4, 16, eo(P(t, .1, 2))), out });
+  kin(title, W / 2, 600, { t, t0: .25, size: 120, weight: 900, stagger: .04, dur: .3, from: { scale: 2.4 }, maxW: 1640, glow: 24, glowColor: hexA(C.jev, .35), out });
+  kin(sub, W / 2, 700, { t, t0: .6, size: 42, weight: 700, color: C.dim, stagger: .014, dur: .25, from: { dy: 30 }, out });
+  ctx.restore();
+}
+
+// Big-tech spotlight: OpenAI Decisions API vs AWS Strands Decider (local 0 – 5.8)
+const SPOT = [
+  { head: 'OPENAI · DEVDAY', name: 'Decisions API', tag: '2026.09.29 · 제한적 프리뷰', col: C.jev2, dir: -1,
+    lines: ['경량 모델 GPT-6 Luna를 선택 문제에 집중', '문장 대신, 미리 정의한 선택지 중 하나', '분류 · 요청 라우팅 · 에이전트 다음 액션', '텍스트 + 이미지 컨텍스트로 확률 출력'],
+    punch: '→ 자사 API 생태계로 판단 계층 흡수' },
+  { head: 'AWS · AMAZON WEB SERVICES', name: 'Strands Decider 2B', tag: '2026.10.01 · Apache 2.0 전면 공개', col: C.jev, dir: 1,
+    lines: ['1.9B · LM 헤드 제거, 1M 프런티어 헤드', 'RTX 3090 115ms · 같은 상태 다중 질문', '라우팅 · 도구 선정 · 가드레일 · 평가', '가중치 · 학습 데이터 · 스크립트 공개'],
+    punch: '→ 에이전트 프레임워크에 그대로 탑재' }
+];
+function spotCard(t, x, y, w, h, t0, d) {
+  const u = expo(P(t, t0, t0 + .45));
+  if (u <= 0) return;
+  ctx.save(); ctx.translate(d.dir * 240 * (1 - u), 0);
+  card(x, y, w, h, { alpha: u, stroke: hexA(d.col, .65), glow: 40 * u, glowColor: hexA(d.col, .25) });
+  kin(d.head, x + 44, y + 70, { t, t0: t0 + .1, size: 26, weight: 700, fam: MONO, color: d.col, align: 'left', stagger: .01, dur: .2, scramble: .25 });
+  kin(d.name, x + 44, y + 172, { t, t0: t0 + .15, size: 80, weight: 900, align: 'left', stagger: .025, dur: .3, from: { dx: d.dir * 140, skew: -.4 * d.dir }, trail: 1, maxW: w - 88 });
+  const pu = eback(P(t, t0 + .4, t0 + .65));
+  if (pu > 0) { ctx.save(); ctx.globalAlpha *= clamp(pu); pill(d.tag, x + 44, y + 205, { size: 26, color: d.col }); ctx.restore(); }
+  d.lines.forEach((l, i) => {
+    const lu = P(t, t0 + .55 + i * .18, t0 + .75 + i * .18);
+    if (lu > 0) dot(x + 54, y + 342 + i * 72, 5, d.col, lu);
+    kin(l, x + 76, y + 352 + i * 72, { t, t0: t0 + .55 + i * .18, size: 32, weight: 700, align: 'left', stagger: .008, dur: .25, from: { dy: 24 }, maxW: w - 120 });
+  });
+  kin(d.punch, x + 44, y + 640, { t, t0: t0 + 1.4, size: 36, weight: 900, color: d.col, align: 'left', stagger: .015, dur: .3, from: { scale: 1.8 }, maxW: w - 88 });
+  ctx.restore();
+}
+function spotlight(t) {
+  const a = env(t, 0, 5.8, .15, .35);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  marquee('OPENAI  ×  AWS  ×  OPENAI  ×  AWS  ×  ', 1010, { t, size: 170, fam: MONO, weight: 700, speed: 150, alpha: .06, stroke: 2, color: C.jev });
+  kin([['빅테크가 ', C.text], ['직접', C.llm], [' 뛰어들었다', C.text]], W / 2, 150, { t, t0: .1, size: 80, weight: 900, stagger: .035, dur: .3, from: { scale: 2.4 } });
+  spotCard(t, 100, 220, 830, 690, .5, SPOT[0]);
+  spotCard(t, 990, 220, 830, 690, 2.4, SPOT[1]);
+  kin('VS', W / 2 + 0, 580, { t, t0: 2.35, size: 46, weight: 700, fam: MONO, color: C.dim, stagger: .05, dur: .25, from: { scale: 3, rot: .6 } });
+  kin([['+ Cloudflare Clef', C.text], ['  Jev API 100% 호환', C.jev], ['    ·    + NVIDIA × Stanford CLM-8B', C.text]], W / 2, 985,
+      { t, t0: 4.3, size: 32, weight: 700, stagger: .01, dur: .25, from: { dy: 30 } });
+  ctx.restore();
+}
+
+// Market escalation (local 0 – 9.6)
+const STATS = [
+  { v: 2, fmt: v => Math.round(v) + '주', label: 'Jev 공개 후 경과', sub: '경쟁작이 쏟아지기까지' },
+  { v: 15, fmt: v => Math.round(v) + '+', label: '경쟁 디시전 모델', sub: '오픈소스 · 상용 API · 연구 모델' },
+  { v: 4, fmt: v => Math.round(v) + '곳', label: '빅테크 참전', sub: 'OpenAI · AWS · Cloudflare · NVIDIA' }
+];
+const FORCES = [
+  { n: '01', title: '판단 계층이 플랫폼 기본 기능으로', desc: 'OpenAI는 API로, AWS는 Strands 에이전트 프레임워크로 직접 제공' },
+  { n: '02', title: '오픈 웨이트 확산 → 가격 압박', desc: 'AWS · Cloudflare · Laya · GLiNER 모두 Apache 2.0 공개' },
+  { n: '03', title: 'API 호환 경쟁 → 갈아타기 쉬워짐', desc: 'Clef는 엔드포인트와 모델명만 바꾸면 Jev 대체 가능' }
+];
+function market(t, IMP) {
+  const a = env(t, 0, 9.6, .15, .35);
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha *= a;
+  // phase 1: headline + heat bar + stats
+  const p1 = 1 - eio(P(t, 3.95, 4.25));
+  if (p1 > 0) {
+    ctx.save(); ctx.globalAlpha *= p1;
+    marquee('ESCALATION  ·  격화  ·  ESCALATION  ·  격화  ·  ', 1010, { t, size: 160, fam: MONO, weight: 700, speed: -200, alpha: .06, stroke: 2, color: C.llm });
+    kin('시장은', W / 2, 190, { t, t0: .05, size: 60, weight: 700, stagger: .04, dur: .3, from: { dy: 40 } });
+    kin([['더 ', C.text], ['격해진다', C.llm]], W / 2, 380, { t, t0: .3, size: 190, weight: 900, stagger: .07, dur: .28, from: { scale: 3 }, glow: 50, glowColor: hexA(C.llm, .5) });
+    const x0 = 360, x1 = 1560, by = 450, fu = expo(P(t, .7, 1.4));
+    ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.08)'; rrect(x0, by, x1 - x0, 18, 9); ctx.fill();
+    ctx.fillStyle = grad(x0, 0, x1, 0, C.warn, C.llm); ctx.shadowBlur = 30; ctx.shadowColor = C.llm;
+    rrect(x0, by, Math.max(18, (x1 - x0) * fu), 18, 9); ctx.fill(); ctx.restore();
+    text('Jev 공개', x0, by + 52, { size: 24, weight: 700, fam: MONO, color: C.dim, alpha: eo(P(t, .8, 1.1)) });
+    text('2주 후 · 빅테크 참전', x1, by + 52, { size: 24, weight: 700, color: C.llm, align: 'right', alpha: eo(P(t, 1.2, 1.5)) });
+    STATS.forEach((s, i) => {
+      const cx = 480 + i * 480, t0 = 1.6 + i * .35, u = expo(P(t, t0, t0 + .3));
+      if (u <= 0) return;
+      ctx.save(); ctx.globalAlpha *= clamp(u * 2); ctx.translate(cx, 720); ctx.scale(lerp(2, 1, u), lerp(2, 1, u));
+      setFont(150, 700, MONO); ctx.textAlign = 'center'; ctx.shadowBlur = 40; ctx.shadowColor = hexA(C.llm, .5);
+      ctx.fillStyle = grad(-150, -100, 150, 0, C.warn, C.llm); ctx.fillText(s.fmt(s.v * eo(P(t, t0, t0 + .5))), 0, 0); ctx.restore();
+      kin(s.label, cx, 800, { t, t0: t0 + .2, size: 40, weight: 900, stagger: .02, dur: .25, from: { dy: 30 } });
+      kin(s.sub, cx, 850, { t, t0: t0 + .3, size: 24, weight: 500, color: C.dim, stagger: .006, dur: .2 });
+    });
+    ctx.restore();
+  }
+  // phase 2: three forces
+  if (t > 4.25) {
+    kin([['경쟁이 격해지는 ', C.text], ['3가지 이유', C.llm]], W / 2, 170, { t, t0: 4.3, size: 64, weight: 900, stagger: .03, dur: .3, from: { scale: 2.2 } });
+    FORCES.forEach((f, i) => {
+      const t0 = 4.45 + i, y = 250 + i * 205, u = expo(P(t, t0, t0 + .45));
+      if (u <= 0) return;
+      ctx.save(); ctx.translate(300 * (1 - u), 0);
+      card(210, y, 1500, 180, { alpha: u, stroke: hexA(C.llm, .5), glow: 30 * u, glowColor: hexA(C.llm, .18) });
+      ctx.restore();
+      kin(f.n, 260, y + 122, { t, t0: t0 + .05, size: 96, weight: 700, fam: MONO, align: 'left', gradient: [C.warn, C.llm], stagger: .06, dur: .25, scramble: .2 });
+      kin(f.title, 450, y + 82, { t, t0: t0 + .12, size: 54, weight: 900, align: 'left', stagger: .022, dur: .3, from: { dx: 160, skew: -.4 }, trail: 1, maxW: 1220 });
+      kin(f.desc, 450, y + 140, { t, t0: t0 + .35, size: 30, weight: 500, color: C.dim, align: 'left', stagger: .006, dur: .2, from: { dy: 16 }, maxW: 1220 });
+    });
+    kin([['LLM이 독점하던 ', C.text], ["'판단'", C.jev], [', 이제 모두가 노린다', C.text]], W / 2, 975,
+        { t, t0: 7.55, size: 54, weight: 900, stagger: .025, dur: .3, from: { scale: 2.2 }, glow: 20, glowColor: hexA(C.jev, .35) });
+    text('※ 전망은 바이라인네트워크 보도 내용을 바탕으로 한 해석입니다', W - 120, 1040, { size: 20, weight: 400, color: C.dim, align: 'right', alpha: eo(P(t, 4.6, 5)) });
+  }
+  ctx.restore();
+}
+
+impact(.3, 1.1, C.llm); impact(2.45, .7); impact(.45, 1.4, C.llm);
+
+  return {
+    draw(t, scene) { const [cx, cy] = camera(t); ctx.save(); ctx.translate(cx, cy); const CH = { ch1: ['01', 'Jev는 무엇인가', '텍스트를 생성하지 않고, 결정하는 System One 모델'],
+                ch2: ['02', 'LLM 대비 강점', '속도 · 비용 · 정확성 · 신뢰도'],
+                ch3: ['03', '2주 만의 추격전', 'Jev가 연 시장에 쏟아진 경쟁 모델들'],
+                ch4: ['04', '빅테크 참전, 격해지는 시장', 'OpenAI와 AWS가 직접 뛰어들었다'] };
+      if (CH[scene]) chapter(t, ...CH[scene]); else if (scene === 'spot') spotlight(t); else if (scene === 'market') market(t); ctx.restore(); flash(t); },
+    warm: (t, scene) => scene === 'market' ? env(t, 0, 4.2, .2, .4) * .8 : 0
+  };
+})();
+
+const MODS = { W: MOD_W, J: MOD_J, N: MOD_N };
+const TL_TIMES = [...Array(9)].map((_, k) => 16.4 + k * .88);
+// ================= MASTER TIMELINE (3:00) =================
+// Each segment plays a range of a source module's timeline and freezes at "hold" points
+// (source times where the scene is fully built) so every scene can be read before moving on.
+const TOTAL = 180, END_HOLD_MIN = 3;
+const PARTS = {
+  0: 'DECISION AI · INTRO', 1: 'PART 01 · Jev는 무엇인가', 2: 'PART 02 · LLM 대비 강점',
+  3: 'PART 03 · 2주 만의 추격전', 4: 'PART 04 · 빅테크 참전, 격해지는 시장', 5: 'OUTRO'
+};
+const tlHolds = TL_TIMES.map(s0 => [s0 + .68, 2.6]);
+const SEGS = [
+  // intro hook + headline (byline piece)
+  { ns: 'W', a: 0, b: 6.05, part: 0, holds: [[1.35, 1.6], [1.55 + .29, .45], [1.85 + .29, .45], [2.15 + .29, .45], [2.45 + .29, .45], [3.0, 1.0], [5.4, 3.0]] },
+  { ns: 'N', scene: 'ch1', a: 0, b: 2.6, part: 1, holds: [[1.3, 1.2]] },
+  // Jev explainer: LLM problem → 결정 → title → mechanism
+  { ns: 'J', a: 0, b: 15.55, part: 1, holds: [[3.95, 3.5], [7.1, 2.5], [9.5, 2.5], [11.5, 2.5], [13.2, 3.2], [15.0, 3.5]] },
+  { ns: 'N', scene: 'ch2', a: 0, b: 2.6, part: 2, holds: [[1.3, 1.2]] },
+  // byline numbers (193.6× / 444.6× / $7/h)
+  { ns: 'W', a: 7.5, b: 10.45, part: 2, holds: [[8.2, 2.5], [9.1, 2.5], [10.0, 2.5]] },
+  // Jev five differentiators + duel + use cases
+  { ns: 'J', a: 15.45, b: 27.25, part: 2, holds: [[16.3, 2.6], [17.4, 2.6], [18.5, 2.6], [19.6, 2.6], [20.7, 2.6], [23.1, 3.5], [26.6, 3.5]] },
+  // agent architecture split
+  { ns: 'W', a: 11.15, b: 14.05, part: 2, holds: [[11.85, 1.5], [13.6, 3.5]] },
+  { ns: 'N', scene: 'ch3', a: 0, b: 2.6, part: 3, holds: [[1.3, 1.2]] },
+  // two paths + 2-week timeline
+  { ns: 'W', a: 14.05, b: 24.45, part: 3, holds: [[16.0, 3.0], ...tlHolds] },
+  { ns: 'N', scene: 'ch4', a: 0, b: 2.6, part: 4, holds: [[1.3, 1.2]] },
+  { ns: 'N', scene: 'spot', a: 0, b: 5.8, part: 4, holds: [[2.25, 3.5], [4.15, 3.5], [4.9, 2.5]] },
+  { ns: 'N', scene: 'market', a: 0, b: 9.6, part: 4, holds: [[1.3, 1.5], [3.6, 3.0], [5.25, 2.6], [6.25, 2.6], [7.25, 2.6], [8.4, 3.0]] },
+  // name wall + verdict + end card
+  { ns: 'W', a: 24.35, b: 27.45, part: 5, holds: [[26.6, 3.0]] },
+  { ns: 'W', a: 27.35, b: 30.0, part: 5, holds: [[29.6, 2.5]], fadeOut: .35 },
+  { ns: 'J', a: 27.1, b: 29.95, part: 5, holds: [[29.95, 0]], fadeIn: .3, end: true }
+];
+// fit holds so the whole piece lands exactly on TOTAL seconds (end card keeps the remainder)
+(function fit() {
+  let play = 0, hold = 0;
+  for (const s of SEGS) { play += s.b - s.a; for (const h of s.holds) hold += h[1]; }
+  const scale = Math.min(1.25, (TOTAL - play - END_HOLD_MIN) / hold);
+  let used = 0;
+  for (const s of SEGS) { s.holds = s.holds.map(([x, d]) => [x, d * scale]); }
+  for (const s of SEGS) { s.dur = (s.b - s.a) + s.holds.reduce((v, h) => v + h[1], 0); used += s.dur; }
+  const last = SEGS[SEGS.length - 1];
+  last.holds[last.holds.length - 1][1] += TOTAL - used; last.dur += TOTAL - used;
+  let m = 0; for (const s of SEGS) { s.m0 = m; m += s.dur; }
+  window.TIMING = { play, hold, scale, endHold: last.holds[last.holds.length - 1][1] };
+})();
+function locate(T) {
+  let seg = SEGS[SEGS.length - 1];
+  for (const s of SEGS) if (T < s.m0 + s.dur) { seg = s; break; }
+  let lt = T - seg.m0, src = seg.a, m = 0, held = 0, totalHold = 0;
+  for (const h of seg.holds) totalHold += h[1];
+  for (const [x, d] of seg.holds) {
+    if (lt < m + (x - src)) return { seg, src: src + (lt - m), held, totalHold, lt };
+    m += x - src; src = x;
+    if (lt < m + d) return { seg, src: x, held: held + (lt - m), totalHold, lt };
+    m += d; held += d;
+  }
+  return { seg, src: Math.min(seg.b, src + (lt - m)), held, totalHold, lt };
+}
+
+function masterBackground(t, warm) {
+  ctx.fillStyle = C.bg; ctx.fillRect(-50, -50, W + 100, H + 100);
+  ctx.save(); ctx.strokeStyle = 'rgba(120,150,200,0.06)'; ctx.lineWidth = 1;
+  const s = 80, off = (t * 12) % s;
+  for (let x = -s + off; x < W + s; x += s) { ctx.beginPath(); ctx.moveTo(x, -50); ctx.lineTo(x, H + 50); ctx.stroke(); }
+  for (let y = -s + off * .5; y < H + s; y += s) { ctx.beginPath(); ctx.moveTo(-50, y); ctx.lineTo(W + 50, y); ctx.stroke(); }
+  ctx.restore();
+  const cx = W * .5 + Math.sin(t * .6) * 220, cy = H * .5 + Math.cos(t * .5) * 90;
+  const g2 = ctx.createRadialGradient(cx, cy, 0, cx, cy, 1000);
+  g2.addColorStop(0, hexA(C.jev, .085)); g2.addColorStop(.5, hexA(C.jev2, .04)); g2.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g2; ctx.fillRect(0, 0, W, H);
+  if (warm > 0) {
+    const g1 = ctx.createRadialGradient(W * .3, H * .45, 0, W * .3, H * .45, 950);
+    g1.addColorStop(0, hexA(C.llm, .11 * warm)); g1.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g1; ctx.fillRect(0, 0, W, H);
+  }
+}
+function masterHud(T, seg) {
+  ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fillRect(0, H - 6, W, 6);
+  ctx.fillStyle = grad(0, 0, W, 0); ctx.fillRect(0, H - 6, W * (T / TOTAL), 6);
+  // chapter ticks on the progress bar
+  for (const s of SEGS) if (s.ns === 'N' && s.scene.startsWith('ch')) { ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fillRect(W * s.m0 / TOTAL - 1, H - 10, 2, 10); }
+  const a = seg.end ? 1 - P(T - seg.m0, 0, .4) : P(T, .4, .9);
+  const mm = String(Math.floor(T / 60)).padStart(2, '0'), ss = String(Math.floor(T % 60)).padStart(2, '0');
+  text(PARTS[seg.part], 60, 64, { size: 20, weight: 700, fam: seg.part ? KR : MONO, color: C.dim2, alpha: a });
+  text(`${mm}:${ss} / 03:00`, W - 60, 64, { size: 20, weight: 700, fam: MONO, color: C.dim2, align: 'right', alpha: a });
+}
+
+window.render = function (T) {
+  LIVE = T;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1;
+  const L = locate(T), seg = L.seg, mod = MODS[seg.ns];
+  masterBackground(T, mod.warm ? mod.warm(L.src, seg.scene) : 0);
+  ctx.save();
+  // gentle push-in while a scene is held, so frozen moments still breathe
+  const z = 1 + .018 * (L.totalHold ? L.held / L.totalHold : 0);
+  ctx.translate(W / 2, H / 2); ctx.scale(z, z); ctx.translate(-W / 2, -H / 2);
+  let fa = 1;
+  if (seg.fadeIn) fa *= P(L.lt, 0, seg.fadeIn);
+  if (seg.fadeOut) fa *= 1 - P(L.lt, seg.dur - seg.fadeOut, seg.dur);
+  ctx.globalAlpha = fa;
+  mod.draw(L.src, seg.scene);
+  ctx.restore();
+  vignette(); masterHud(T, seg);
+};
+window.ready = loadFonts().then(() => { window.render(0); return true; });
+if (!location.search.includes('capture')) {
+  window.ready.then(() => { const t0 = performance.now(); (function loop() { window.render(((performance.now() - t0) / 1000) % TOTAL); requestAnimationFrame(loop); })(); });
+}
+
+</script>
+</body></html>
