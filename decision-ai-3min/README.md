@@ -1,6 +1,6 @@
 # 디시전 AI — 3분 통합 모션그래픽
 
-`decision-ai-3min.mp4` (1920×1080, 30fps, 3:00, 무음)
+`decision-ai-3min.mp4` (1920×1080, 30fps, 3:00, 스테레오 AAC 192kbps · -17 LUFS)
 
 두 영상을 하나로 합쳤습니다.
 - `jev-motion/` — TypeSafe Jev의 용도와 LLM 대비 차별점 (30초판)
@@ -37,3 +37,24 @@ NODE_PATH=$(npm root -g) node render.js video                   # decision-ai-3m
 ```
 
 폰트(`fonts/`)는 `jev-motion/README.md`와 같습니다.
+
+## 사운드
+
+배경음과 효과음은 외부 음원 없이 `audio/audio.py`(numpy)로 직접 합성했습니다.
+
+- **효과음 타이밍**: 렌더 엔진을 계측해 화면 속 동작 시점을 그대로 뽑았습니다(`audio/instrument.py` → `audio/extract_sfx.js` → `sfx_events.json`). 멈춤(홀드) 구간을 반영한 마스터 시간 기준입니다.
+  - 카메라 임팩트 61개 → 저역 붐 + 노이즈 버스트 (LLM 장면은 거친 디스토션)
+  - 글자 슬램 31개 → 킥 + 스냅 + 금속성 링
+  - 스큐 인 · 트레일 36개 → 방향에 맞춰 좌우로 흐르는 휘시
+  - 스크램블 디코드 50개 → 디지털 블립
+  - 작은 텍스트 등장 61개 → 틱, LLM 토큰 스트리밍 → 타자 틱
+  - 챕터 카드 4장 앞 → 라이저, 엔드카드 앞 → 스웰
+- **배경음**: 96 BPM, A단조(Am–F–C–G). 파트마다 강도가 바뀝니다. PART 01은 패드와 베이스 중심, PART 03~04로 갈수록 킥 · 하이햇 · 클랩 · 아르페지오가 쌓여 시장 격화 구간에서 가장 강해지고, 아웃트로에서 풀리며 페이드아웃합니다. 타격 순간에는 음악 볼륨이 잠깐 내려가 효과음이 묻히지 않게 했습니다.
+
+```bash
+python3 audio/instrument.py                         # index_sfx.html 생성 (index.html 위치에서)
+NODE_PATH=$(npm root -g) node audio/extract_sfx.js  # sfx_events.json
+python3 audio/audio.py                              # soundtrack.wav (pip install numpy)
+ffmpeg -i soundtrack.wav -af "lowpass=f=16000,loudnorm=I=-16.5:TP=-3:LRA=11,aresample=48000,alimiter=limit=0.66:level=disabled" master.wav
+ffmpeg -i decision-ai-3min-silent.mp4 -i master.wav -map 0:v -map 1:a -c:v copy -c:a aac -b:a 192k -shortest decision-ai-3min.mp4
+```
